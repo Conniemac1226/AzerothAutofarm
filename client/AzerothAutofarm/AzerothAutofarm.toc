@@ -1,0 +1,9 @@
+## Interface: 30300
+## Title: |cffd9a441Azeroth|r |cff72d68bAutofarm|r
+## Notes: Easy client control panel for the AzerothCore mod-autofarm module.
+## Author: AzerothCore Server
+## Version: 1.1.0
+## SavedVariables: AzerothAutofarmDB
+
+Materials.lua
+AzerothAutofarm.lua

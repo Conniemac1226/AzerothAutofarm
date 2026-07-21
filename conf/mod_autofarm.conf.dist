@@ -1,0 +1,54 @@
+[worldserver]
+
+#
+# mod-autofarm
+# Server-side material farming coordinator for characters controlled by mod-playerbots.
+#
+
+# Enable the module and its .autofarm commands.
+# Default: 1
+Autofarm.Enable = 1
+
+# Teleport a bot to the first point of the selected farming route.
+# Default: 1
+Autofarm.TeleportToRoute = 1
+
+# Return the bot to its original location when stopped or when its quantity goal is reached.
+# Default: 1
+Autofarm.ReturnOnStop = 1
+
+# Maps that may be selected for outdoor farming. Empty means the four WotLK outdoor continents.
+# Default: "0,1,530,571"
+Autofarm.AllowedMaps = "0,1,530,571"
+
+# Size of the cells used to find a productive cluster of item sources, in yards.
+# Default: 1800
+Autofarm.ClusterSize = 1800
+
+# Include source spawns this far from the selected cluster center, in yards.
+# Default: 2800
+Autofarm.ClusterRadius = 2800
+
+# Maximum spawn points kept in one route. The nearest-neighbor route loops when complete.
+# Default: 300
+Autofarm.MaxRoutePoints = 300
+
+# Do not deliberately farm normal creatures more than this many levels above the bot.
+# Default: 3
+Autofarm.MaxCreatureLevelsAboveBot = 3
+
+# Manager update interval, in milliseconds.
+# Default: 1000
+Autofarm.UpdateIntervalMs = 1000
+
+# Give a node or corpse this long to finish looting/gathering before continuing, in milliseconds.
+# Default: 15000
+Autofarm.InteractionTimeoutMs = 15000
+
+# Skip a route point when travel has made no useful progress for this long, in milliseconds.
+# Default: 120000
+Autofarm.RoutePointTimeoutMs = 120000
+
+# Emit route and interaction diagnostics.
+# Default: 0
+Autofarm.Debug = 0
