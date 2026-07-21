@@ -22,6 +22,7 @@
 #include "MovementActions.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
+#include "Pet.h"
 #include "Player.h"
 #include "PlayerScript.h"
 #include "Playerbots.h"
@@ -77,6 +78,8 @@ namespace
         bool teleportToRoute = true;
         bool returnOnStop = true;
         bool useFlyingMounts = true;
+        bool suppressRestAndBuffs = true;
+        bool passiveNodeGathering = true;
         bool debug = false;
         float flightHeight = 35.0f;
         float clusterSize = 1800.0f;
@@ -87,6 +90,7 @@ namespace
         uint32 interactionTimeoutMs = 15000;
         uint32 routePointTimeoutMs = 120000;
         uint32 flightCombatEscapeMs = 6000;
+        uint32 keepAliveIntervalMs = 60000;
         std::unordered_set<uint32> allowedMaps = {0, 1, 530, 571};
     };
 
@@ -185,9 +189,14 @@ namespace
         bool itemWasAlwaysLooted = false;
         bool recoveringFromDeath = false;
         bool combatStrategiesSuppressed = false;
+        bool passiveNodeGathering = false;
+        bool npcImmunityApplied = false;
+        ObjectGuid petGuid;
+        bool petNpcImmunityApplied = false;
         FlightStage flightStage = FlightStage::None;
         float flightCruiseZ = std::numeric_limits<float>::lowest();
         uint32 flightCombatStartedAtMs = 0;
+        uint32 lastKeepAliveAtMs = 0;
         WorldLocation returnLocation;
         std::vector<StrategyState> strategies;
         std::vector<std::string> combatStrategies;
@@ -381,6 +390,46 @@ namespace
         return !hasSkillRequirement;
     }
 
+    SkillType GetGameObjectGatheringSkill(GameObjectTemplate const* gameObjectTemplate)
+    {
+        if (!gameObjectTemplate)
+            return SKILL_NONE;
+
+        LockEntry const* lock = sLockStore.LookupEntry(gameObjectTemplate->GetLockId());
+        if (!lock)
+            return SKILL_NONE;
+
+        for (uint8 index = 0; index < 8; ++index)
+        {
+            if (lock->Type[index] != LOCK_KEY_SKILL)
+                continue;
+
+            SkillType skill = SkillByLockType(LockType(lock->Index[index]));
+            if (skill == SKILL_MINING || skill == SKILL_HERBALISM)
+                return skill;
+        }
+
+        return SKILL_NONE;
+    }
+
+    bool IsMiningOrHerbalismRoute(std::vector<SourceSpawn> const& sources)
+    {
+        if (sources.empty())
+            return false;
+
+        for (SourceSpawn const& source : sources)
+        {
+            if (!(source.sourceMask & SOURCE_GAMEOBJECT))
+                return false;
+
+            GameObjectTemplate const* gameObjectTemplate = sObjectMgr->GetGameObjectTemplate(source.entry);
+            if (GetGameObjectGatheringSkill(gameObjectTemplate) == SKILL_NONE)
+                return false;
+        }
+
+        return true;
+    }
+
     bool CanSkinCreature(Player const* bot, CreatureTemplate const* creatureTemplate)
     {
         if (!bot || !creatureTemplate || !creatureTemplate->SkinLootId)
@@ -479,6 +528,10 @@ namespace
             _config.teleportToRoute = sConfigMgr->GetOption<bool>("Autofarm.TeleportToRoute", true);
             _config.returnOnStop = sConfigMgr->GetOption<bool>("Autofarm.ReturnOnStop", true);
             _config.useFlyingMounts = sConfigMgr->GetOption<bool>("Autofarm.UseFlyingMounts", true);
+            _config.suppressRestAndBuffs =
+                sConfigMgr->GetOption<bool>("Autofarm.SuppressRestAndBuffs", true);
+            _config.passiveNodeGathering =
+                sConfigMgr->GetOption<bool>("Autofarm.PassiveNodeGathering", true);
             _config.debug = sConfigMgr->GetOption<bool>("Autofarm.Debug", false);
             _config.flightHeight = std::clamp(
                 sConfigMgr->GetOption<float>("Autofarm.FlightHeight", 35.0f), 15.0f, 100.0f);
@@ -498,6 +551,10 @@ namespace
                 sConfigMgr->GetOption<uint32>("Autofarm.RoutePointTimeoutMs", 120000));
             _config.flightCombatEscapeMs = std::max<uint32>(2000,
                 sConfigMgr->GetOption<uint32>("Autofarm.FlightCombatEscapeMs", 6000));
+            _config.keepAliveIntervalMs =
+                sConfigMgr->GetOption<uint32>("Autofarm.KeepAliveIntervalMs", 60000);
+            if (_config.keepAliveIntervalMs)
+                _config.keepAliveIntervalMs = std::max<uint32>(10000, _config.keepAliveIntervalMs);
 
             _config.allowedMaps.clear();
             std::string allowedMaps = sConfigMgr->GetOption<std::string>("Autofarm.AllowedMaps", "0,1,530,571");
@@ -589,9 +646,12 @@ namespace
             session->startedAtMs = getMSTime();
             session->returnLocation = WorldLocation(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
                 bot->GetPositionZ(), bot->GetOrientation());
+            session->passiveNodeGathering = _config.passiveNodeGathering &&
+                IsMiningOrHerbalismRoute(selectedSources);
             BuildRoute(*session, std::move(selectedSources));
 
             CaptureAndApplyStrategies(botAI, *session);
+            ApplyPlayerOverrides(botAI, *session);
 
             RoutePoint const& firstPoint = session->route.front();
             if (_config.teleportToRoute)
@@ -601,6 +661,7 @@ namespace
                     firstPoint.source.z, firstPoint.source.orientation))
                 {
                     RestoreStrategies(botAI, *session);
+                    RestorePlayerOverrides(bot, *session);
                     handler->SendErrorMessage("The playerbot could not teleport to the selected farming route.");
                     return false;
                 }
@@ -616,6 +677,7 @@ namespace
 
             uint32 routeSize = session->route.size();
             uint32 routeMap = firstPoint.source.mapId;
+            bool passiveNodeGathering = session->passiveNodeGathering;
             _sessions.emplace(bot->GetGUID(), std::move(session));
 
             handler->PSendSysMessage(
@@ -624,6 +686,11 @@ namespace
                 SourceDescription(sourceMask), goalAmount ? std::to_string(goalAmount) : std::string("unlimited"));
             handler->SendSysMessage("Playerbots combat, recovery, looting, gathering, and skinning are active. "
                 "Usable incidental profession nodes will also be gathered.");
+            if (_config.suppressRestAndBuffs)
+                handler->SendSysMessage("Resting and repetitive buffing are suppressed; health and mana recover "
+                    "between fights.");
+            if (passiveNodeGathering)
+                handler->SendSysMessage("This mining/herbalism node route ignores NPC aggro.");
             return true;
         }
 
@@ -1315,19 +1382,24 @@ namespace
             return false;
         }
 
-        static void CaptureAndApplyStrategies(PlayerbotAI* botAI, FarmSession& session)
+        void CaptureAndApplyStrategies(PlayerbotAI* botAI, FarmSession& session) const
         {
-            static std::vector<std::pair<std::string, bool>> const desiredStrategies =
+            std::vector<std::pair<std::string, bool>> desiredStrategies =
             {
                 {"loot", true},
                 {"gather", true},
-                {"grind", true},
                 {"travel", true},
                 {"follow", false},
                 {"stay", false},
                 {"rpg", false},
                 {"move random", false}
             };
+            desiredStrategies.emplace_back("grind", !_config.suppressRestAndBuffs);
+            if (_config.suppressRestAndBuffs)
+            {
+                desiredStrategies.emplace_back("food", false);
+                desiredStrategies.emplace_back("buff", false);
+            }
 
             session.combatStrategies = botAI->GetStrategies(BOT_STATE_COMBAT);
             for (auto const& [name, enabled] : desiredStrategies)
@@ -1341,6 +1413,102 @@ namespace
                 ->GetValue<std::set<uint32>&>("always loot list")->Get();
             session.itemWasAlwaysLooted = alwaysLoot.contains(session.itemId);
             alwaysLoot.insert(session.itemId);
+        }
+
+        void ApplyPlayerOverrides(PlayerbotAI* botAI, FarmSession& session) const
+        {
+            Player* bot = botAI->GetBot();
+            if (_config.suppressRestAndBuffs)
+            {
+                botAI->InterruptSpell();
+                if (bot->getStandState() != UNIT_STAND_STATE_STAND)
+                    bot->SetStandState(UNIT_STAND_STATE_STAND);
+            }
+
+            if (!session.passiveNodeGathering)
+                return;
+
+            if (!bot->IsImmuneToNPC())
+            {
+                bot->SetImmuneToNPC(true);
+                session.npcImmunityApplied = true;
+            }
+
+            ApplyPetNpcImmunity(bot, session);
+        }
+
+        static void ApplyPetNpcImmunity(Player* bot, FarmSession& session)
+        {
+            Pet* pet = bot->GetPet();
+            if (!pet || pet->GetGUID() == session.petGuid)
+                return;
+
+            if (session.petNpcImmunityApplied && !session.petGuid.IsEmpty())
+            {
+                if (Pet* previousPet = ObjectAccessor::GetPet(*bot, session.petGuid))
+                    previousPet->SetImmuneToNPC(false);
+            }
+
+            session.petGuid = pet->GetGUID();
+            session.petNpcImmunityApplied = !pet->IsImmuneToNPC();
+            if (session.petNpcImmunityApplied)
+                pet->SetImmuneToNPC(true);
+        }
+
+        void MaintainPlayerOverrides(PlayerbotAI* botAI, FarmSession& session) const
+        {
+            Player* bot = botAI->GetBot();
+            if (_config.keepAliveIntervalMs)
+            {
+                if (bot->isAFK())
+                    bot->ToggleAFK();
+
+                uint32 now = getMSTime();
+                if (!session.lastKeepAliveAtMs ||
+                    getMSTimeDiff(session.lastKeepAliveAtMs, now) >= _config.keepAliveIntervalMs)
+                {
+                    if (WorldSession* worldSession = bot->GetSession())
+                        worldSession->ResetTimeOutTime(true);
+                    session.lastKeepAliveAtMs = now;
+                }
+            }
+
+            if (_config.suppressRestAndBuffs && bot->IsAlive() && !bot->IsInCombat())
+            {
+                if (bot->getStandState() != UNIT_STAND_STATE_STAND)
+                    bot->SetStandState(UNIT_STAND_STATE_STAND);
+
+                if (bot->GetHealth() < bot->GetMaxHealth())
+                    bot->SetHealth(bot->GetMaxHealth());
+
+                uint32 maxMana = bot->GetMaxPower(POWER_MANA);
+                if (maxMana && bot->GetPower(POWER_MANA) < maxMana)
+                    bot->SetPower(POWER_MANA, maxMana);
+            }
+
+            if (session.passiveNodeGathering)
+            {
+                if (!bot->IsImmuneToNPC())
+                    bot->SetImmuneToNPC(true);
+                ApplyPetNpcImmunity(bot, session);
+            }
+        }
+
+        static void RestorePlayerOverrides(Player* bot, FarmSession& session)
+        {
+            if (!bot)
+                return;
+
+            if (session.petNpcImmunityApplied && !session.petGuid.IsEmpty())
+            {
+                if (Pet* pet = ObjectAccessor::GetPet(*bot, session.petGuid))
+                    pet->SetImmuneToNPC(false);
+            }
+            session.petNpcImmunityApplied = false;
+
+            if (session.npcImmunityApplied)
+                bot->SetImmuneToNPC(false);
+            session.npcImmunityApplied = false;
         }
 
         static void RestoreStrategies(PlayerbotAI* botAI, FarmSession& session)
@@ -1506,6 +1674,8 @@ namespace
             PlayerbotAI* botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
             if (!botAI)
                 return "playerbot AI is no longer available";
+
+            MaintainPlayerOverrides(botAI, session);
 
             if (!IsFlightTravelReady(bot))
                 RestoreFlightCombatStrategies(botAI, session);
@@ -1713,6 +1883,7 @@ namespace
             Player* bot = ObjectAccessor::FindConnectedPlayer(botGuid);
             PlayerbotAI* botAI = bot ? sPlayerbotsMgr.GetPlayerbotAI(bot) : nullptr;
             RestoreStrategies(botAI, *session);
+            RestorePlayerOverrides(bot, *session);
 
             bool returned = false;
             if (returnBot && bot && bot->IsInWorld() && bot->IsAlive() && !bot->IsInCombat() &&

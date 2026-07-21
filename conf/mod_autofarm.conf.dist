@@ -17,6 +17,24 @@ Autofarm.TeleportToRoute = 1
 # Default: 1
 Autofarm.ReturnOnStop = 1
 
+# Prevent playerbots from eating, drinking, or repeatedly refreshing class buffs while autofarming.
+# Health and mana are restored out of combat so creature farming does not stall between fights.
+# The bot's original food, buff, and grind strategies are restored when the session stops.
+# Default: 1
+Autofarm.SuppressRestAndBuffs = 1
+
+# Make bots and their active pets immune to NPC aggro on routes made entirely from mining or herbalism nodes.
+# This does not hide them from players, prevent node interaction, or affect creature-loot/skinning routes.
+# The prior NPC-immunity state is restored when the session stops.
+# Default: 1
+Autofarm.PassiveNodeGathering = 1
+
+# Keep an autofarming character out of AFK state and refresh its server session activity timer.
+# Playerbots have no client keyboard to press, so this is the server-side equivalent of periodic input.
+# Set to 0 to disable. Non-zero values below 10000 are raised to 10000 milliseconds.
+# Default: 60000
+Autofarm.KeepAliveIntervalMs = 60000
+
 # Use a known flying mount or flight form for route travel in Outland and Northrend.
 # The bot takes off for travel, lands only at the selected source, and ignores unrelated
 # combat while still airborne. Normal combat is restored if it is forced off the mount.
