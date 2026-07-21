@@ -17,6 +17,7 @@
 #include "LootMgr.h"
 #include "LootObjectStack.h"
 #include "LootValues.h"
+#include "Map.h"
 #include "MotionMaster.h"
 #include "MovementActions.h"
 #include "ObjectAccessor.h"
@@ -56,15 +57,28 @@ namespace
     constexpr uint8 SOURCE_CREATURE_SKIN = 0x04;
     constexpr float AUTOFARM_INTERACTION_DISTANCE = INTERACTION_DISTANCE - 2.0f;
     constexpr float AUTOFARM_PROGRESS_DISTANCE = 1.0f;
+    constexpr float AUTOFARM_FLIGHT_APPROACH_DISTANCE = 28.0f;
+    constexpr float AUTOFARM_FLIGHT_LANDING_HEIGHT = 3.0f;
     constexpr uint32 AUTOFARM_STUCK_TIMEOUT_MS = 8 * IN_MILLISECONDS;
     constexpr uint8 AUTOFARM_RETRIES_BEFORE_TELEPORT = 2;
+
+    enum class FlightStage : uint8
+    {
+        None,
+        Takeoff,
+        Cruise,
+        Landing,
+        Evading
+    };
 
     struct AutofarmConfig
     {
         bool enabled = true;
         bool teleportToRoute = true;
         bool returnOnStop = true;
+        bool useFlyingMounts = true;
         bool debug = false;
+        float flightHeight = 35.0f;
         float clusterSize = 1800.0f;
         float clusterRadius = 2800.0f;
         uint32 maxRoutePoints = 300;
@@ -72,6 +86,7 @@ namespace
         uint32 updateIntervalMs = 1000;
         uint32 interactionTimeoutMs = 15000;
         uint32 routePointTimeoutMs = 120000;
+        uint32 flightCombatEscapeMs = 6000;
         std::unordered_set<uint32> allowedMaps = {0, 1, 530, 571};
     };
 
@@ -128,6 +143,12 @@ namespace
             return MoveTo(source.mapId, source.x, source.y, source.z, false, false, false, true,
                 MovementPriority::MOVEMENT_FORCED, true);
         }
+
+        bool FlyTo(uint32 mapId, float x, float y, float z)
+        {
+            return MoveTo(mapId, x, y, z, false, false, false, true,
+                MovementPriority::MOVEMENT_FORCED, true);
+        }
     };
 
     struct RoutePoint
@@ -163,8 +184,13 @@ namespace
         bool waitingForInitialTeleport = false;
         bool itemWasAlwaysLooted = false;
         bool recoveringFromDeath = false;
+        bool combatStrategiesSuppressed = false;
+        FlightStage flightStage = FlightStage::None;
+        float flightCruiseZ = std::numeric_limits<float>::lowest();
+        uint32 flightCombatStartedAtMs = 0;
         WorldLocation returnLocation;
         std::vector<StrategyState> strategies;
+        std::vector<std::string> combatStrategies;
         std::vector<RoutePoint> route;
     };
 
@@ -452,7 +478,10 @@ namespace
             _config.enabled = sConfigMgr->GetOption<bool>("Autofarm.Enable", true);
             _config.teleportToRoute = sConfigMgr->GetOption<bool>("Autofarm.TeleportToRoute", true);
             _config.returnOnStop = sConfigMgr->GetOption<bool>("Autofarm.ReturnOnStop", true);
+            _config.useFlyingMounts = sConfigMgr->GetOption<bool>("Autofarm.UseFlyingMounts", true);
             _config.debug = sConfigMgr->GetOption<bool>("Autofarm.Debug", false);
+            _config.flightHeight = std::clamp(
+                sConfigMgr->GetOption<float>("Autofarm.FlightHeight", 35.0f), 15.0f, 100.0f);
             _config.clusterSize = std::max(200.0f,
                 sConfigMgr->GetOption<float>("Autofarm.ClusterSize", 1800.0f));
             _config.clusterRadius = std::max(_config.clusterSize,
@@ -467,6 +496,8 @@ namespace
                 sConfigMgr->GetOption<uint32>("Autofarm.InteractionTimeoutMs", 15000));
             _config.routePointTimeoutMs = std::max<uint32>(10000,
                 sConfigMgr->GetOption<uint32>("Autofarm.RoutePointTimeoutMs", 120000));
+            _config.flightCombatEscapeMs = std::max<uint32>(2000,
+                sConfigMgr->GetOption<uint32>("Autofarm.FlightCombatEscapeMs", 6000));
 
             _config.allowedMaps.clear();
             std::string allowedMaps = sConfigMgr->GetOption<std::string>("Autofarm.AllowedMaps", "0,1,530,571");
@@ -668,6 +699,14 @@ namespace
                     state = "Corpse recovery";
                 else if (bot->IsBeingTeleported())
                     state = "Teleporting";
+                else if (session.flightStage == FlightStage::Takeoff)
+                    state = "Taking off";
+                else if (session.flightStage == FlightStage::Cruise)
+                    state = "Flying to source";
+                else if (session.flightStage == FlightStage::Landing)
+                    state = "Landing at source";
+                else if (session.flightStage == FlightStage::Evading)
+                    state = "Evading attackers";
                 else if (bot->IsInCombat())
                     state = "Combat";
                 else if (session.interactionStartedAtMs)
@@ -1066,6 +1105,216 @@ namespace
             botAI->ChangeStrategy(std::string(enable ? "+" : "-") + name, state);
         }
 
+        static void SuppressFlightCombatStrategies(PlayerbotAI* botAI, FarmSession& session)
+        {
+            if (session.combatStrategiesSuppressed)
+                return;
+
+            botAI->ClearStrategies(BOT_STATE_COMBAT);
+            session.combatStrategiesSuppressed = true;
+        }
+
+        static void RestoreFlightCombatStrategies(PlayerbotAI* botAI, FarmSession& session)
+        {
+            if (!botAI || !session.combatStrategiesSuppressed)
+                return;
+
+            botAI->ClearStrategies(BOT_STATE_COMBAT);
+            for (std::string const& strategy : session.combatStrategies)
+                botAI->ChangeStrategy("+" + strategy, BOT_STATE_COMBAT);
+            session.combatStrategiesSuppressed = false;
+        }
+
+        static bool IsValidHeight(float height)
+        {
+            return std::isfinite(height) && height != INVALID_HEIGHT && height != VMAP_INVALID_HEIGHT_VALUE;
+        }
+
+        static float GetSurfaceHeight(Player* bot, float x, float y, float fallback)
+        {
+            Map* map = bot->GetMap();
+            if (!map)
+                return fallback;
+
+            float surface = fallback;
+            float ground = map->GetHeight(x, y, MAX_HEIGHT, false);
+            if (IsValidHeight(ground))
+                surface = std::max(surface, ground);
+
+            float water = map->GetWaterLevel(x, y);
+            if (IsValidHeight(water))
+                surface = std::max(surface, water);
+            return surface;
+        }
+
+        float CalculateFlightCruiseZ(Player* bot, SourceSpawn const& source) const
+        {
+            float startX = bot->GetPositionX();
+            float startY = bot->GetPositionY();
+            float deltaX = source.x - startX;
+            float deltaY = source.y - startY;
+            float distance = std::hypot(deltaX, deltaY);
+            uint32 samples = std::clamp<uint32>(static_cast<uint32>(std::ceil(distance / 100.0f)), 1, 40);
+            float highestSurface = source.z;
+
+            for (uint32 index = 0; index <= samples; ++index)
+            {
+                float ratio = static_cast<float>(index) / static_cast<float>(samples);
+                float x = startX + deltaX * ratio;
+                float y = startY + deltaY * ratio;
+                highestSurface = std::max(highestSurface, GetSurfaceHeight(bot, x, y, source.z));
+            }
+
+            return std::max(bot->GetPositionZ(), highestSurface + _config.flightHeight);
+        }
+
+        static bool IsFarmCreatureEngaged(Player* bot, RoutePoint const& point)
+        {
+            if (point.source.sourceMask & SOURCE_GAMEOBJECT)
+                return false;
+
+            Creature* creature = ObjectAccessor::GetSpawnedCreatureByDBGUID(point.source.mapId,
+                point.source.spawnId);
+            if (!creature || !creature->IsAlive())
+                return false;
+
+            Unit* victim = creature->GetVictim();
+            return bot->GetVictim() == creature || victim == bot ||
+                (victim && victim->GetOwnerGUID() == bot->GetGUID());
+        }
+
+        static void ClearActiveFlight(Player* bot)
+        {
+            if (!bot->HasUnitMovementFlag(MOVEMENTFLAG_FLYING | MOVEMENTFLAG_ASCENDING |
+                MOVEMENTFLAG_DESCENDING))
+                return;
+
+            bot->RemoveUnitMovementFlag(MOVEMENTFLAG_FLYING | MOVEMENTFLAG_ASCENDING |
+                MOVEMENTFLAG_DESCENDING);
+            if (!bot->IsRooted())
+                bot->SendMovementFlagUpdate();
+        }
+
+        static bool StartFlightMove(PlayerbotAI* botAI, FarmSession& session, FlightStage stage,
+            float x, float y, float z, uint32 now)
+        {
+            Player* bot = botAI->GetBot();
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+            bot->RemoveUnitMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
+            botAI->GetAiObjectContext()->GetValue<LastMovement&>("last movement")->Get().clear();
+
+            if (!bot->HasUnitMovementFlag(MOVEMENTFLAG_FLYING))
+            {
+                bot->AddUnitMovementFlag(MOVEMENTFLAG_FLYING);
+                if (!bot->IsRooted())
+                    bot->SendMovementFlagUpdate();
+            }
+
+            AutofarmMovementAction movement(botAI);
+            if (!movement.FlyTo(bot->GetMapId(), x, y, z))
+                return false;
+
+            session.flightStage = stage;
+            session.lastRouteProgressAtMs = now;
+            return true;
+        }
+
+        bool IsFlightTravelReady(Player* bot) const
+        {
+            if (!_config.useFlyingMounts || (bot->GetMapId() != 530 && bot->GetMapId() != 571))
+                return false;
+
+            bool mountedFlight = bot->IsMounted() && bot->HasIncreaseMountedFlightSpeedAura();
+            ShapeshiftForm form = bot->GetShapeshiftForm();
+            bool flightForm = bot->HasFlyAura() && (form == FORM_FLIGHT || form == FORM_FLIGHT_EPIC);
+            return mountedFlight || flightForm;
+        }
+
+        bool UpdateFlightTravel(PlayerbotAI* botAI, FarmSession& session, RoutePoint const& point, uint32 now)
+        {
+            Player* bot = botAI->GetBot();
+            SuppressFlightCombatStrategies(botAI, session);
+
+            bool farmCreatureEngaged = IsFarmCreatureEngaged(bot, point);
+            bool evadingUnrelatedCombat = bot->IsInCombat() && !farmCreatureEngaged;
+            if (evadingUnrelatedCombat)
+            {
+                if (!session.flightCombatStartedAtMs)
+                    session.flightCombatStartedAtMs = now;
+                else if (getMSTimeDiff(session.flightCombatStartedAtMs, now) >= _config.flightCombatEscapeMs)
+                {
+                    if (_config.debug)
+                    {
+                        LOG_DEBUG("module.autofarm",
+                            "Bot {} remained in unrelated combat while flying; skipped route point {}/{}",
+                            bot->GetName(), session.routeIndex + 1, session.route.size());
+                    }
+                    AdvanceRoute(botAI, session);
+                    return true;
+                }
+            }
+            else
+                session.flightCombatStartedAtMs = 0;
+
+            float horizontalDistance = bot->GetExactDist2d(point.source.x, point.source.y);
+            if (session.lastRouteDistance == std::numeric_limits<float>::max() ||
+                horizontalDistance + AUTOFARM_PROGRESS_DISTANCE < session.lastRouteDistance)
+            {
+                session.lastRouteDistance = horizontalDistance;
+                session.lastRouteProgressAtMs = now;
+                session.stuckRecoveryAttempts = 0;
+            }
+
+            if (session.flightCruiseZ == std::numeric_limits<float>::lowest())
+                session.flightCruiseZ = CalculateFlightCruiseZ(bot, point.source);
+
+            if (horizontalDistance > AUTOFARM_FLIGHT_APPROACH_DISTANCE)
+            {
+                if (bot->GetPositionZ() + AUTOFARM_FLIGHT_LANDING_HEIGHT < session.flightCruiseZ)
+                {
+                    if (session.flightStage != FlightStage::Takeoff || !bot->isMoving())
+                    {
+                        StartFlightMove(botAI, session, FlightStage::Takeoff, bot->GetPositionX(),
+                            bot->GetPositionY(), session.flightCruiseZ, now);
+                    }
+                }
+                else if (session.flightStage != FlightStage::Cruise || !bot->isMoving())
+                {
+                    StartFlightMove(botAI, session, FlightStage::Cruise, point.source.x, point.source.y,
+                        session.flightCruiseZ, now);
+                }
+                return true;
+            }
+
+            if (evadingUnrelatedCombat)
+            {
+                float surface = GetSurfaceHeight(bot, bot->GetPositionX(), bot->GetPositionY(), point.source.z);
+                float escapeZ = std::max(bot->GetPositionZ(), surface + _config.flightHeight);
+                if (session.flightStage != FlightStage::Evading || !bot->isMoving())
+                {
+                    StartFlightMove(botAI, session, FlightStage::Evading, bot->GetPositionX(),
+                        bot->GetPositionY(), escapeZ, now);
+                }
+                return true;
+            }
+
+            if (bot->GetPositionZ() > point.source.z + AUTOFARM_FLIGHT_LANDING_HEIGHT)
+            {
+                if (session.flightStage != FlightStage::Landing || !bot->isMoving())
+                {
+                    StartFlightMove(botAI, session, FlightStage::Landing, point.source.x, point.source.y,
+                        point.source.z + 1.0f, now);
+                }
+                return true;
+            }
+
+            ClearActiveFlight(bot);
+            session.flightStage = FlightStage::None;
+            session.flightCruiseZ = std::numeric_limits<float>::lowest();
+            return false;
+        }
+
         static void CaptureAndApplyStrategies(PlayerbotAI* botAI, FarmSession& session)
         {
             static std::vector<std::pair<std::string, bool>> const desiredStrategies =
@@ -1080,6 +1329,7 @@ namespace
                 {"move random", false}
             };
 
+            session.combatStrategies = botAI->GetStrategies(BOT_STATE_COMBAT);
             for (auto const& [name, enabled] : desiredStrategies)
             {
                 bool wasEnabled = botAI->HasStrategy(name, BOT_STATE_NON_COMBAT);
@@ -1093,11 +1343,12 @@ namespace
             alwaysLoot.insert(session.itemId);
         }
 
-        static void RestoreStrategies(PlayerbotAI* botAI, FarmSession const& session)
+        static void RestoreStrategies(PlayerbotAI* botAI, FarmSession& session)
         {
             if (!botAI)
                 return;
 
+            RestoreFlightCombatStrategies(botAI, session);
             TravelMgr::instance().setNullTravelTarget(botAI->GetBot());
             botAI->GetAiObjectContext()->GetValue<ObjectGuid>("pull target")->Reset();
             botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({});
@@ -1131,6 +1382,9 @@ namespace
             session.lastRouteDistance = std::numeric_limits<float>::max();
             session.lastRouteProgressAtMs = session.pointStartedAtMs;
             session.stuckRecoveryAttempts = 0;
+            session.flightStage = FlightStage::None;
+            session.flightCruiseZ = std::numeric_limits<float>::lowest();
+            session.flightCombatStartedAtMs = 0;
 
             if (AutofarmMgr::Instance()._config.debug)
             {
@@ -1253,6 +1507,9 @@ namespace
             if (!botAI)
                 return "playerbot AI is no longer available";
 
+            if (!IsFlightTravelReady(bot))
+                RestoreFlightCombatStrategies(botAI, session);
+
             if (!bot->IsAlive() || bot->HasPlayerFlag(PLAYER_FLAGS_GHOST))
             {
                 RecoverFromDeath(botAI, session);
@@ -1287,9 +1544,6 @@ namespace
                 return std::nullopt;
             }
 
-            if (bot->IsInCombat())
-                return std::nullopt;
-
             if (bot->InBattleground() || bot->InArena() || (bot->FindMap() && bot->FindMap()->Instanceable()))
                 return "bot entered an unsupported instanced map";
 
@@ -1312,6 +1566,17 @@ namespace
             }
 
             float distance = bot->GetExactDist(point.source.x, point.source.y, point.source.z);
+            if (IsFlightTravelReady(bot))
+            {
+                if (UpdateFlightTravel(botAI, session, point, now))
+                    return std::nullopt;
+                RestoreFlightCombatStrategies(botAI, session);
+            }
+
+            bool farmCreatureEngaged = IsFarmCreatureEngaged(bot, point);
+            if (bot->IsInCombat() && !farmCreatureEngaged)
+                return std::nullopt;
+
             bool needsRouteProgress = distance > 35.0f ||
                 ((point.source.sourceMask & SOURCE_GAMEOBJECT) && distance > AUTOFARM_INTERACTION_DISTANCE);
             if (needsRouteProgress && RecoverStalledRoute(botAI, session, point, distance, now))

@@ -17,6 +17,22 @@ Autofarm.TeleportToRoute = 1
 # Default: 1
 Autofarm.ReturnOnStop = 1
 
+# Use a known flying mount or flight form for route travel in Outland and Northrend.
+# The bot takes off for travel, lands only at the selected source, and ignores unrelated
+# combat while still airborne. Normal combat is restored if it is forced off the mount.
+# Default: 1
+Autofarm.UseFlyingMounts = 1
+
+# Minimum cruising clearance above the highest sampled terrain between route points, in yards.
+# Range: 15-100
+# Default: 35
+Autofarm.FlightHeight = 35
+
+# Skip a dangerous route point after remaining in unrelated combat while airborne for this long.
+# This lets the bot fly away instead of hovering indefinitely over an attacker.
+# Default: 6000
+Autofarm.FlightCombatEscapeMs = 6000
+
 # Maps that may be selected for outdoor farming. Empty means the four WotLK outdoor continents.
 # Default: "0,1,530,571"
 Autofarm.AllowedMaps = "0,1,530,571"

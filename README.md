@@ -64,6 +64,9 @@ The quantity is the number newly collected during that session. Omit `--count` o
 - Incidental resources: while targeting copper, any usable nearby mining/herbalism node such as tin is still gathered.
 - Creature corpses are fully looted and skinned when the character has the required profession.
 - Combat, attackers encountered on the route, death, and recovery are handled by the bot's normal class AI.
+- In Outland and Northrend, a bot with usable flying automatically takes off, cruises above sampled terrain, and lands
+  at the selected source. Unrelated attackers do not make it dismount; if it is forced off the mount, its original
+  combat strategies are restored so it can defend itself.
 
 The route is generated from the server's current world data. It therefore follows custom spawns and custom loot without
 requiring a module update.
@@ -86,6 +89,6 @@ requiring a module update.
 
 Copy `conf/mod_autofarm.conf.dist` to the installed module configuration directory as `mod_autofarm.conf`. Important
 options control teleport/return behavior, allowed maps, cluster size, route size, creature-level tolerance, timeouts,
-and debug logging.
+flying travel height and escape timing, and debug logging.
 
 No SQL updates or core patches are required.
