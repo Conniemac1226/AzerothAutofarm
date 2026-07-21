@@ -10,6 +10,13 @@ local DATA = AzerothAutofarmData or { categories = {}, materials = {} }
 local ROW_HEIGHT = 29
 local ROW_COUNT = 9
 local FALLBACK_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+local MAIN_FRAME_WIDTH = 860
+local MAIN_FRAME_HEIGHT = 675
+local LOG_FRAME_WIDTH = 700
+local LOG_FRAME_HEIGHT = 560
+local HELP_FRAME_WIDTH = 590
+local HELP_FRAME_HEIGHT = 500
+local FRAME_SCREEN_MARGIN = 32
 
 local COLORS = {
     window = { 0.020, 0.025, 0.032, 0.985 },
@@ -118,6 +125,19 @@ end
 
 local function SetFontColor(fontString, color)
     fontString:SetTextColor(color[1], color[2], color[3], color[4] or 1)
+end
+
+local function FitFrameToScreen(frame, nativeWidth, nativeHeight)
+    if not frame or not UIParent then
+        return
+    end
+
+    local screenWidth = tonumber(UIParent:GetWidth()) or nativeWidth
+    local screenHeight = tonumber(UIParent:GetHeight()) or nativeHeight
+    local availableWidth = math.max(1, screenWidth - FRAME_SCREEN_MARGIN)
+    local availableHeight = math.max(1, screenHeight - FRAME_SCREEN_MARGIN)
+    local scale = math.min(1, availableWidth / nativeWidth, availableHeight / nativeHeight)
+    frame:SetScale(math.max(0.5, scale))
 end
 
 local function GetMaterialById(itemId)
@@ -756,7 +776,7 @@ end
 
 function AF:CreateLogFrame()
     local frame = CreateFrame("Frame", "AzerothAutofarmLogFrame", UIParent)
-    frame:SetSize(700, 560)
+    frame:SetSize(LOG_FRAME_WIDTH, LOG_FRAME_HEIGHT)
     frame:SetPoint("CENTER", UIParent, "CENTER", 70, 15)
     frame:SetFrameStrata("DIALOG")
     frame:SetClampedToScreen(true)
@@ -908,6 +928,7 @@ function AF:CreateLogFrame()
         self:StopMovingOrSizing()
     end)
     frame:SetScript("OnShow", function()
+        self:UpdateFrameScales()
         self.activityPollElapsed = 0
         self.statusUnavailable = false
         self.activityAutoButton:SetButtonText(self.db.activity.autoRefresh and "Auto: On" or "Auto: Off")
@@ -953,12 +974,15 @@ end
 
 function AF:CreateHelpFrame()
     local frame = CreateFrame("Frame", "AzerothAutofarmHelpFrame", UIParent)
-    frame:SetSize(590, 500)
+    frame:SetSize(HELP_FRAME_WIDTH, HELP_FRAME_HEIGHT)
     frame:SetPoint("CENTER")
     frame:SetFrameStrata("DIALOG")
     frame:SetClampedToScreen(true)
     SetBackdrop(frame, COLORS.window, COLORS.accent, WINDOW_BACKDROP)
     frame:Hide()
+    frame:SetScript("OnShow", function()
+        self:UpdateFrameScales()
+    end)
 
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 22, -21)
@@ -1084,7 +1108,7 @@ end
 
 function AF:CreateMainFrame()
     local frame = CreateFrame("Frame", "AzerothAutofarmFrame", UIParent)
-    frame:SetSize(860, 650)
+    frame:SetSize(MAIN_FRAME_WIDTH, MAIN_FRAME_HEIGHT)
     frame:SetFrameStrata("DIALOG")
     frame:SetClampedToScreen(true)
     frame:SetMovable(true)
@@ -1104,6 +1128,9 @@ function AF:CreateMainFrame()
     frame:SetScript("OnDragStop", function(selfFrame)
         selfFrame:StopMovingOrSizing()
         self:SaveFramePosition()
+    end)
+    frame:SetScript("OnShow", function()
+        self:UpdateFrameScales()
     end)
     frame:Hide()
 
@@ -1496,17 +1523,30 @@ function AF:CreateMainFrame()
         StaticPopup_Show("AZEROTH_AUTOFARM_STOP_ALL")
     end)
 
-    local activityText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    activityText:SetPoint("BOTTOMLEFT", 18, 8)
-    activityText:SetPoint("BOTTOMRIGHT", -18, 8)
+    local footer = CreateFrame("Frame", nil, frame)
+    footer:SetPoint("BOTTOMLEFT", 14, 10)
+    footer:SetPoint("BOTTOMRIGHT", -14, 10)
+    footer:SetHeight(22)
+    SetBackdrop(footer, COLORS.panel, COLORS.borderSoft)
+
+    local activityText = footer:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    activityText:SetPoint("LEFT", 8, 0)
+    activityText:SetPoint("RIGHT", -8, 0)
     activityText:SetHeight(13)
     activityText:SetJustifyH("LEFT")
+    activityText:SetWordWrap(false)
     activityText:SetText("Ready — choose a playerbot and material")
     SetFontColor(activityText, COLORS.muted)
     self.activityText = activityText
 
     self.mainFrame = frame
     table.insert(UISpecialFrames, "AzerothAutofarmFrame")
+end
+
+function AF:UpdateFrameScales()
+    FitFrameToScreen(self.mainFrame, MAIN_FRAME_WIDTH, MAIN_FRAME_HEIGHT)
+    FitFrameToScreen(self.logFrame, LOG_FRAME_WIDTH, LOG_FRAME_HEIGHT)
+    FitFrameToScreen(self.helpFrame, HELP_FRAME_WIDTH, HELP_FRAME_HEIGHT)
 end
 
 function AF:HandleSystemMessage(message)
@@ -1584,6 +1624,7 @@ function AF:Initialize()
     self:CreateHelpFrame()
     self:CreateMainFrame()
     self:CreateMinimapButton()
+    self:UpdateFrameScales()
     self:RefreshCategories()
     self:RefreshMaterials(true)
     self:UpdateSelectedItem()
@@ -1639,6 +1680,7 @@ function AF:Initialize()
 
     self:RegisterEvent("CHAT_MSG_SYSTEM")
     self:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+    self:RegisterEvent("DISPLAY_SIZE_CHANGED")
     self:Print("loaded. Type |cffffcc5c/autofarm|r or click the minimap button.")
 end
 
@@ -1654,6 +1696,8 @@ AF:SetScript("OnEvent", function(self, event, ...)
     elseif event == "GET_ITEM_INFO_RECEIVED" then
         self:RefreshMaterials(false)
         self:UpdateSelectedItem()
+    elseif event == "DISPLAY_SIZE_CHANGED" then
+        self:UpdateFrameScales()
     end
 end)
 

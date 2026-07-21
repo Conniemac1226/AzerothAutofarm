@@ -1,4 +1,4 @@
-AZEROTH AUTOFARM 1.1.0
+AZEROTH AUTOFARM 1.1.1
 ======================
 
 A standalone World of Warcraft 3.3.5a control panel for the AzerothCore
@@ -55,6 +55,8 @@ NOTES
   movement, combat, gathering, looting, and session management.
 - Activity monitoring does not scan units, maps, combat logs, or inventory on
   the client. Automatic refresh can be disabled from the Activity window.
+- The main, Activity, and Help windows automatically scale to fit the current
+  display resolution and UI scale while preserving their internal layout.
 - The playerbot must already be online through mod-playerbots.
 - Gathering professions, skill, and required tools are still required.
 - Fishing presets only work when an outdoor fishing-school source exists.

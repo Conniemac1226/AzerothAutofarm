@@ -21,7 +21,8 @@ that is logged in by the server as a playerbot, so it is neither required nor us
 The WotLK 3.3.5a `AzerothAutofarm` addon in `client/AzerothAutofarm/` provides a standalone graphical control panel for
 the commands below. It includes material presets, custom item/link input, favorites, quantity goals, bot selection,
 session controls, an activity log, help, and a minimap button. It has no external addon dependencies and does not
-perform movement or combat; it sends requests to this server module.
+perform movement or combat; it sends requests to this server module. Its main, Activity, and Help windows automatically
+scale to fit the current display resolution and UI scale.
 
 ## Commands
 
