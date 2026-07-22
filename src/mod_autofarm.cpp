@@ -27,7 +27,6 @@
 #include "Player.h"
 #include "PlayerScript.h"
 #include "Playerbots.h"
-#include "PoolMgr.h"
 #include "ScriptMgr.h"
 #include "StringFormat.h"
 #include "Timer.h"
@@ -64,7 +63,8 @@ namespace
     constexpr float AUTOFARM_FLIGHT_LANDING_HEIGHT = 3.0f;
     constexpr uint32 AUTOFARM_STUCK_TIMEOUT_MS = 8 * IN_MILLISECONDS;
     constexpr uint32 AUTOFARM_NODE_RETRY_MS = 3 * IN_MILLISECONDS;
-    constexpr uint8 AUTOFARM_RETRIES_BEFORE_SKIP = 2;
+    constexpr uint8 AUTOFARM_RETRIES_BEFORE_SKIP = 4;
+    constexpr float AUTOFARM_GROUND_APPROACH_RADIUS = 6.0f;
 
     enum class FlightStage : uint8
     {
@@ -142,14 +142,25 @@ namespace
 
         bool MoveToTarget(WorldObject* target)
         {
-            return MoveTo(target->GetMapId(), target->GetPositionX(), target->GetPositionY(),
-                target->GetPositionZ(), false, false, true, false, MovementPriority::MOVEMENT_FORCED, true);
+            return MoveNear(target, 0.5f, MovementPriority::MOVEMENT_FORCED);
         }
 
-        bool MoveToPoint(SourceSpawn const& source)
+        bool MoveNearPoint(SourceSpawn const& source)
         {
-            return MoveTo(source.mapId, source.x, source.y, source.z, false, false, true, false,
-                MovementPriority::MOVEMENT_FORCED, true);
+            float startAngle = std::atan2(bot->GetPositionY() - source.y, bot->GetPositionX() - source.x);
+            for (uint8 index = 0; index < 8; ++index)
+            {
+                float angle = startAngle + static_cast<float>(index) * static_cast<float>(M_PI / 4.0);
+                float x = source.x + std::cos(angle) * AUTOFARM_GROUND_APPROACH_RADIUS;
+                float y = source.y + std::sin(angle) * AUTOFARM_GROUND_APPROACH_RADIUS;
+                float z = source.z;
+                bot->UpdateAllowedPositionZ(x, y, z);
+                if (MoveTo(source.mapId, x, y, z, false, false, true, false,
+                    MovementPriority::MOVEMENT_FORCED, true))
+                    return true;
+            }
+
+            return false;
         }
 
         bool FlyTo(uint32 mapId, float x, float y, float z)
@@ -1082,9 +1093,6 @@ namespace
                     continue;
                 if (!(data.phaseMask & PHASEMASK_NORMAL))
                     continue;
-                if (sPoolMgr->IsPartOfAPool<GameObject>(spawnId) &&
-                    !sPoolMgr->IsSpawnedObject<GameObject>(spawnId))
-                    continue;
 
                 sources.push_back({spawnId, data.id, data.mapid, data.posX, data.posY, data.posZ, data.orientation,
                     SOURCE_GAMEOBJECT});
@@ -1098,6 +1106,129 @@ namespace
             return sMapMgr->GetZoneId(PHASEMASK_NORMAL, source.mapId, source.x, source.y, source.z);
         }
 
+        static std::vector<size_t> LimitZoneSources(std::vector<SourceSpawn> const& sources,
+            std::vector<size_t> const& zoneIndices, size_t limit, float centerX, float centerY)
+        {
+            if (zoneIndices.size() <= limit)
+                return zoneIndices;
+
+            std::vector<size_t> selected;
+            selected.reserve(limit);
+            std::vector<double> nearestSelectedDistance(zoneIndices.size(),
+                std::numeric_limits<double>::max());
+            std::vector<bool> used(zoneIndices.size(), false);
+
+            size_t next = 0;
+            double nearestCenterDistance = std::numeric_limits<double>::max();
+            for (size_t position = 0; position < zoneIndices.size(); ++position)
+            {
+                SourceSpawn const& source = sources[zoneIndices[position]];
+                double distance = SquaredDistance(source.x, source.y, centerX, centerY);
+                if (distance < nearestCenterDistance)
+                {
+                    nearestCenterDistance = distance;
+                    next = position;
+                }
+            }
+
+            while (selected.size() < limit)
+            {
+                used[next] = true;
+                size_t selectedIndex = zoneIndices[next];
+                selected.push_back(selectedIndex);
+                SourceSpawn const& selectedSource = sources[selectedIndex];
+
+                double farthestDistance = -1.0;
+                size_t farthest = next;
+                for (size_t position = 0; position < zoneIndices.size(); ++position)
+                {
+                    if (used[position])
+                        continue;
+
+                    SourceSpawn const& source = sources[zoneIndices[position]];
+                    nearestSelectedDistance[position] = std::min(nearestSelectedDistance[position],
+                        SquaredDistance(source.x, source.y, selectedSource.x, selectedSource.y));
+                    if (nearestSelectedDistance[position] > farthestDistance)
+                    {
+                        farthestDistance = nearestSelectedDistance[position];
+                        farthest = position;
+                    }
+                }
+
+                if (farthestDistance < 0.0)
+                    break;
+                next = farthest;
+            }
+
+            return selected;
+        }
+
+        static std::vector<SourceSpawn> OrderZoneRoute(std::vector<SourceSpawn> const& sources,
+            std::vector<size_t> const& indices, float centerX, float centerY)
+        {
+            std::vector<SourceSpawn> remaining;
+            remaining.reserve(indices.size());
+            for (size_t index : indices)
+                remaining.push_back(sources[index]);
+
+            std::vector<SourceSpawn> ordered;
+            ordered.reserve(remaining.size());
+            float currentX = centerX;
+            float currentY = centerY;
+            while (!remaining.empty())
+            {
+                auto nearest = std::min_element(remaining.begin(), remaining.end(), [currentX, currentY](
+                    SourceSpawn const& left, SourceSpawn const& right)
+                {
+                    return SquaredDistance(left.x, left.y, currentX, currentY) <
+                        SquaredDistance(right.x, right.y, currentX, currentY);
+                });
+
+                currentX = nearest->x;
+                currentY = nearest->y;
+                ordered.push_back(*nearest);
+                remaining.erase(nearest);
+            }
+
+            if (ordered.size() < 4)
+                return ordered;
+
+            auto distance = [](SourceSpawn const& left, SourceSpawn const& right)
+            {
+                return std::sqrt(SquaredDistance(left.x, left.y, right.x, right.y));
+            };
+
+            for (uint8 pass = 0; pass < 4; ++pass)
+            {
+                bool improved = false;
+                for (size_t first = 0; first + 2 < ordered.size(); ++first)
+                {
+                    size_t firstNext = first + 1;
+                    for (size_t second = first + 2; second < ordered.size(); ++second)
+                    {
+                        size_t secondNext = (second + 1) % ordered.size();
+                        if (first == 0 && secondNext == 0)
+                            continue;
+
+                        double currentDistance = distance(ordered[first], ordered[firstNext]) +
+                            distance(ordered[second], ordered[secondNext]);
+                        double swappedDistance = distance(ordered[first], ordered[second]) +
+                            distance(ordered[firstNext], ordered[secondNext]);
+                        if (swappedDistance + 1.0 >= currentDistance)
+                            continue;
+
+                        std::reverse(ordered.begin() + firstNext, ordered.begin() + second + 1);
+                        improved = true;
+                    }
+                }
+
+                if (!improved)
+                    break;
+            }
+
+            return ordered;
+        }
+
         std::vector<SourceSpawn> SelectZone(Player* bot, std::vector<SourceSpawn> const& sources) const
         {
             struct ZoneCandidate
@@ -1109,62 +1240,39 @@ namespace
                 double averageLegDistance = 0.0;
                 double averageGrade = 0.0;
                 float elevationRange = 0.0f;
+                float coverageRadius = 0.0f;
+                size_t possibleSourceCount = 0;
                 std::vector<size_t> indices;
             };
 
             std::unordered_map<ZoneKey, std::vector<size_t>, ZoneKeyHash> zones;
             for (size_t index = 0; index < sources.size(); ++index)
-                zones[{sources[index].mapId, GetSourceZoneId(sources[index])}].push_back(index);
+            {
+                uint32 zoneId = GetSourceZoneId(sources[index]);
+                if (zoneId)
+                    zones[{sources[index].mapId, zoneId}].push_back(index);
+            }
 
             ZoneCandidate best;
             bool found = false;
-            double radiusSquared = static_cast<double>(_config.clusterRadius) * _config.clusterRadius;
             for (auto const& [zoneKey, zoneIndices] : zones)
             {
-                std::unordered_map<uint64, size_t> cells;
-                for (size_t index : zoneIndices)
-                {
-                    SourceSpawn const& source = sources[index];
-                    int32 cellX = static_cast<int32>(std::floor(source.x / _config.clusterSize));
-                    int32 cellY = static_cast<int32>(std::floor(source.y / _config.clusterSize));
-                    uint64 cellKey = (static_cast<uint64>(static_cast<uint32>(cellX)) << 32) |
-                        static_cast<uint32>(cellY);
-                    ++cells[cellKey];
-                }
-
-                auto bestCell = std::max_element(cells.begin(), cells.end(), [](auto const& left, auto const& right)
-                {
-                    return left.second < right.second;
-                });
-                if (bestCell == cells.end())
-                    continue;
-
-                int32 cellX = static_cast<int32>(bestCell->first >> 32);
-                int32 cellY = static_cast<int32>(bestCell->first & 0xFFFFFFFF);
                 ZoneCandidate candidate;
                 candidate.key = zoneKey;
-                candidate.centerX = (static_cast<float>(cellX) + 0.5f) * _config.clusterSize;
-                candidate.centerY = (static_cast<float>(cellY) + 0.5f) * _config.clusterSize;
+                candidate.possibleSourceCount = zoneIndices.size();
                 for (size_t index : zoneIndices)
                 {
                     SourceSpawn const& source = sources[index];
-                    if (SquaredDistance(source.x, source.y, candidate.centerX, candidate.centerY) <= radiusSquared)
-                        candidate.indices.push_back(index);
+                    candidate.centerX += source.x;
+                    candidate.centerY += source.y;
                 }
+                candidate.centerX /= zoneIndices.size();
+                candidate.centerY /= zoneIndices.size();
+                candidate.indices = LimitZoneSources(sources, zoneIndices, _config.maxRoutePoints,
+                    candidate.centerX, candidate.centerY);
+
                 if (candidate.indices.empty())
                     continue;
-                if (candidate.indices.size() > _config.maxRoutePoints)
-                {
-                    std::sort(candidate.indices.begin(), candidate.indices.end(), [&sources, &candidate](
-                        size_t left, size_t right)
-                    {
-                        SourceSpawn const& leftSource = sources[left];
-                        SourceSpawn const& rightSource = sources[right];
-                        return SquaredDistance(leftSource.x, leftSource.y, candidate.centerX, candidate.centerY) <
-                            SquaredDistance(rightSource.x, rightSource.y, candidate.centerX, candidate.centerY);
-                    });
-                    candidate.indices.resize(_config.maxRoutePoints);
-                }
 
                 double nearestDistanceSum = 0.0;
                 double nearestGradeSum = 0.0;
@@ -1175,6 +1283,8 @@ namespace
                     SourceSpawn const& source = sources[index];
                     minimumZ = std::min(minimumZ, source.z);
                     maximumZ = std::max(maximumZ, source.z);
+                    candidate.coverageRadius = std::max(candidate.coverageRadius, static_cast<float>(std::sqrt(
+                        SquaredDistance(source.x, source.y, candidate.centerX, candidate.centerY))));
 
                     double nearestDistance = _config.clusterRadius;
                     double nearestGrade = 1.0;
@@ -1201,9 +1311,9 @@ namespace
                 candidate.elevationRange = maximumZ - minimumZ;
                 double terrainMultiplier = 1.0 + std::min(1.0, candidate.averageGrade) * 8.0;
                 double navigationCost = std::max(40.0, candidate.averageLegDistance) * terrainMultiplier +
-                    candidate.elevationRange * 0.4;
-                size_t effectiveCount = std::min<size_t>(candidate.indices.size(), _config.maxRoutePoints);
-                double productivity = static_cast<double>(effectiveCount) * 1000.0 / navigationCost;
+                    candidate.elevationRange * 0.4 +
+                    std::max(0.0f, candidate.coverageRadius - _config.clusterSize) * 0.02;
+                double productivity = static_cast<double>(candidate.possibleSourceCount) * 1000.0 / navigationCost;
                 double anchorPenalty = FactionAnchorDistance(bot, zoneKey.mapId, candidate.centerX,
                     candidate.centerY) / 10000.0;
                 candidate.score = productivity - anchorPenalty;
@@ -1218,50 +1328,20 @@ namespace
             if (!found)
                 return {};
 
-            std::vector<SourceSpawn> selected;
-            selected.reserve(best.indices.size());
-            for (size_t index : best.indices)
-                selected.push_back(sources[index]);
-
-            if (selected.size() > _config.maxRoutePoints)
-            {
-                std::sort(selected.begin(), selected.end(), [&best](SourceSpawn const& left,
-                    SourceSpawn const& right)
-                {
-                    return SquaredDistance(left.x, left.y, best.centerX, best.centerY) <
-                        SquaredDistance(right.x, right.y, best.centerX, best.centerY);
-                });
-                selected.resize(_config.maxRoutePoints);
-            }
+            std::vector<SourceSpawn> selected = OrderZoneRoute(sources, best.indices, best.centerX, best.centerY);
+            LOG_INFO("module.autofarm", "Bot {} selected zone {} on map {}: {} route points from {} possible spawns",
+                bot->GetName(), best.key.zoneId, best.key.mapId, selected.size(), best.possibleSourceCount);
 
             if (_config.debug)
             {
                 LOG_DEBUG("module.autofarm",
-                    "Selected zone {} on map {} with {} sources, average leg {:.1f}, grade {:.3f}, elevation {:.1f}",
-                    best.key.zoneId, best.key.mapId, selected.size(), best.averageLegDistance, best.averageGrade,
-                    best.elevationRange);
+                    "Selected zone {} on map {} with {} route points from {} possible spawns, average leg {:.1f}, "
+                    "grade {:.3f}, elevation {:.1f}, coverage radius {:.1f}",
+                    best.key.zoneId, best.key.mapId, selected.size(), best.possibleSourceCount,
+                    best.averageLegDistance, best.averageGrade, best.elevationRange, best.coverageRadius);
             }
 
-            std::vector<SourceSpawn> ordered;
-            ordered.reserve(selected.size());
-            float currentX = best.centerX;
-            float currentY = best.centerY;
-            while (!selected.empty())
-            {
-                auto nearest = std::min_element(selected.begin(), selected.end(), [currentX, currentY](
-                    SourceSpawn const& left, SourceSpawn const& right)
-                {
-                    return SquaredDistance(left.x, left.y, currentX, currentY) <
-                        SquaredDistance(right.x, right.y, currentX, currentY);
-                });
-
-                currentX = nearest->x;
-                currentY = nearest->y;
-                ordered.push_back(*nearest);
-                selected.erase(nearest);
-            }
-
-            return ordered;
+            return selected;
         }
 
         static void BuildRoute(FarmSession& session, std::vector<SourceSpawn> sources)
@@ -1827,7 +1907,7 @@ namespace
             }
 
             AutofarmMovementAction movement(botAI);
-            bool movementStarted = movement.MoveToPoint(point.source);
+            bool movementStarted = movement.MoveNearPoint(point.source);
             LOG_WARN("module.autofarm", "Bot {} stalled {:.1f} yards from route point {}/{}; forced path {}",
                 bot->GetName(), distance, session.routeIndex + 1, session.route.size(),
                 movementStarted ? "started" : "could not start");

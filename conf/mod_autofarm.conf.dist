@@ -55,15 +55,18 @@ Autofarm.FlightCombatEscapeMs = 6000
 # Default: "0,1,530,571"
 Autofarm.AllowedMaps = "0,1,530,571"
 
-# Size of the cells used to find a productive compact route inside each candidate zone, in yards.
+# Zone-spread scale used when comparing otherwise similar farming zones, in yards.
+# This does not limit the selected route to a subsection of the zone.
 # Default: 1800
 Autofarm.ClusterSize = 1800
 
-# Include source spawns this far from the selected center without crossing the selected zone boundary, in yards.
+# Nearest-source distance ceiling used while scoring candidate zones, in yards.
+# This does not exclude source points from the selected zone.
 # Default: 2800
 Autofarm.ClusterRadius = 2800
 
-# Maximum spawn points kept in one route. The nearest-neighbor route loops when complete.
+# Maximum spawn points kept in one route. If a zone has more points, they are distributed across the whole zone.
+# The route is optimized into a closed loop when complete.
 # Default: 300
 Autofarm.MaxRoutePoints = 300
 

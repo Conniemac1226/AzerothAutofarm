@@ -58,8 +58,11 @@ The quantity is the number newly collected during that session. Omit `--count` o
 ## Farming behavior
 
 - Every session chooses exactly one zone and remains there. Candidate zones are ranked by usable source density,
-  average distance between nearby sources, terrain grade, and total elevation range, with a small faction-location
-  preference. The route therefore favors a compact, flatter zone over a larger but difficult mountain route.
+  average distance between nearby sources, terrain grade, total elevation range, and overall zone spread, with a small
+  faction-location preference. The route therefore favors a flatter, well-connected zone.
+- The selected route patrols every known possible source spawn in that zone, including inactive members of rotating
+  spawn pools. When a zone exceeds `Autofarm.MaxRoutePoints`, points are spread across the whole zone instead of being
+  taken only from its center. The route is then optimized as a closed loop to avoid a long straight return leg.
 - Ore and herbs: routes through nodes that directly contain the requested item.
 - Cloth and meat: routes through suitable normal creatures whose corpse loot contains the requested item.
 - Leather and scales: routes through suitable skinnable creatures.
@@ -74,8 +77,9 @@ The quantity is the number newly collected during that session. Omit `--count` o
   restored out of combat, and all affected playerbot strategies return to their original state when farming stops.
 - Active sessions clear the AFK flag and periodically refresh the server activity timeout. This is the server-side
   equivalent of input for a playerbot, which has no client keyboard or network socket of its own.
-- Inactive members of mining/herbalism spawn pools are removed when a route is built, reducing travel toward nodes that
-  cannot currently spawn. Unreachable points are skipped instead of teleporting the bot into raw spawn coordinates.
+- Inactive mining/herbalism pool members remain in the route because they are possible future spawn locations. Missing
+  nodes are skipped when visited, and unreachable points are skipped instead of teleporting the bot into raw spawn
+  coordinates.
 - Near a node, autofarm temporarily owns travel and mounting so loot cannot fight a simultaneous remount. Unsafe ground
   movement returns the bot to its last valid position before it can fall through terrain.
 - In Outland and Northrend, a bot with usable flying automatically takes off, cruises above sampled terrain, and lands
@@ -104,7 +108,7 @@ requiring a module update.
 ## Configuration
 
 Copy `conf/mod_autofarm.conf.dist` to the installed module configuration directory as `mod_autofarm.conf`. Important
-options control teleport/return behavior, allowed maps, cluster size, route size, creature-level tolerance, timeouts,
+options control teleport/return behavior, allowed maps, zone scoring, route size, creature-level tolerance, timeouts,
 rest/buff suppression, passive node gathering, session keepalive, flying travel height and escape timing, and debug
 logging.
 
