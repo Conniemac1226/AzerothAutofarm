@@ -721,8 +721,8 @@ function AF:RefreshActivityDashboard()
         .. "  •  " .. FormatNumber(status.loops) .. " loops"
     )
     self.activityLocation:SetText(
-        (status.area or "Unknown area") .. "  •  map " .. (status.map or "?")
-        .. "  •  " .. (status.x or "?") .. ", " .. (status.y or "?")
+        (status.farmzone or "Unknown farm zone") .. "  •  now " .. (status.area or "Unknown area")
+        .. "  •  map " .. (status.map or "?")
     )
     self.activitySource:SetText((status.source or "Material source") .. "  •  " .. distanceText)
     self.activityVitals:SetText(

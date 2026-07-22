@@ -18,6 +18,7 @@
 #include "LootObjectStack.h"
 #include "LootValues.h"
 #include "Map.h"
+#include "MapMgr.h"
 #include "MotionMaster.h"
 #include "MovementActions.h"
 #include "ObjectAccessor.h"
@@ -26,6 +27,7 @@
 #include "Player.h"
 #include "PlayerScript.h"
 #include "Playerbots.h"
+#include "PoolMgr.h"
 #include "ScriptMgr.h"
 #include "StringFormat.h"
 #include "Timer.h"
@@ -61,7 +63,8 @@ namespace
     constexpr float AUTOFARM_FLIGHT_APPROACH_DISTANCE = 28.0f;
     constexpr float AUTOFARM_FLIGHT_LANDING_HEIGHT = 3.0f;
     constexpr uint32 AUTOFARM_STUCK_TIMEOUT_MS = 8 * IN_MILLISECONDS;
-    constexpr uint8 AUTOFARM_RETRIES_BEFORE_TELEPORT = 2;
+    constexpr uint32 AUTOFARM_NODE_RETRY_MS = 3 * IN_MILLISECONDS;
+    constexpr uint8 AUTOFARM_RETRIES_BEFORE_SKIP = 2;
 
     enum class FlightStage : uint8
     {
@@ -139,12 +142,13 @@ namespace
 
         bool MoveToTarget(WorldObject* target)
         {
-            return MoveNear(target, 0.5f, MovementPriority::MOVEMENT_FORCED);
+            return MoveTo(target->GetMapId(), target->GetPositionX(), target->GetPositionY(),
+                target->GetPositionZ(), false, false, true, false, MovementPriority::MOVEMENT_FORCED, true);
         }
 
         bool MoveToPoint(SourceSpawn const& source)
         {
-            return MoveTo(source.mapId, source.x, source.y, source.z, false, false, false, true,
+            return MoveTo(source.mapId, source.x, source.y, source.z, false, false, true, false,
                 MovementPriority::MOVEMENT_FORCED, true);
         }
 
@@ -174,12 +178,14 @@ namespace
         ObjectGuid botGuid;
         ObjectGuid ownerGuid;
         uint32 itemId = 0;
+        uint32 routeZoneId = 0;
         std::string itemName;
         uint32 goalAmount = 0;
         uint32 startingCount = 0;
         uint32 startedAtMs = 0;
         uint32 pointStartedAtMs = 0;
         uint32 interactionStartedAtMs = 0;
+        uint32 sourceUnavailableStartedAtMs = 0;
         uint32 completedLoops = 0;
         size_t routeIndex = 0;
         float lastRouteDistance = std::numeric_limits<float>::max();
@@ -190,38 +196,41 @@ namespace
         bool recoveringFromDeath = false;
         bool combatStrategiesSuppressed = false;
         bool passiveNodeGathering = false;
+        bool nodeApproachActive = false;
         bool npcImmunityApplied = false;
+        bool pcImmunityApplied = false;
         ObjectGuid petGuid;
         bool petNpcImmunityApplied = false;
+        bool petPcImmunityApplied = false;
         FlightStage flightStage = FlightStage::None;
         float flightCruiseZ = std::numeric_limits<float>::lowest();
         uint32 flightCombatStartedAtMs = 0;
         uint32 lastKeepAliveAtMs = 0;
         WorldLocation returnLocation;
+        WorldLocation lastSafeLocation;
+        bool hasLastSafeLocation = false;
         std::vector<StrategyState> strategies;
         std::vector<std::string> combatStrategies;
         std::vector<RoutePoint> route;
     };
 
-    struct ClusterKey
+    struct ZoneKey
     {
         uint32 mapId = 0;
-        int32 x = 0;
-        int32 y = 0;
+        uint32 zoneId = 0;
 
-        bool operator==(ClusterKey const& other) const
+        bool operator==(ZoneKey const& other) const
         {
-            return mapId == other.mapId && x == other.x && y == other.y;
+            return mapId == other.mapId && zoneId == other.zoneId;
         }
     };
 
-    struct ClusterKeyHash
+    struct ZoneKeyHash
     {
-        size_t operator()(ClusterKey const& key) const
+        size_t operator()(ZoneKey const& key) const
         {
             size_t seed = std::hash<uint32>{}(key.mapId);
-            seed ^= std::hash<int32>{}(key.x) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-            seed ^= std::hash<int32>{}(key.y) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            seed ^= std::hash<uint32>{}(key.zoneId) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
             return seed;
         }
     };
@@ -628,11 +637,11 @@ namespace
                 return false;
             }
 
-            std::vector<SourceSpawn> selectedSources = SelectCluster(bot, sources);
+            std::vector<SourceSpawn> selectedSources = SelectZone(bot, sources);
             if (selectedSources.empty())
             {
                 handler->SendErrorMessage(
-                    "No productive source cluster could be selected for [{}].", itemTemplate->Name1);
+                    "No productive single-zone route could be selected for [{}].", itemTemplate->Name1);
                 return false;
             }
 
@@ -641,11 +650,14 @@ namespace
             session->ownerGuid = handler->GetPlayer()->GetGUID();
             session->itemId = itemTemplate->ItemId;
             session->itemName = itemTemplate->Name1;
+            session->routeZoneId = GetSourceZoneId(selectedSources.front());
             session->goalAmount = goalAmount;
             session->startingCount = bot->GetItemCount(itemTemplate->ItemId);
             session->startedAtMs = getMSTime();
             session->returnLocation = WorldLocation(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
                 bot->GetPositionZ(), bot->GetOrientation());
+            session->lastSafeLocation = session->returnLocation;
+            session->hasLastSafeLocation = true;
             session->passiveNodeGathering = _config.passiveNodeGathering &&
                 IsMiningOrHerbalismRoute(selectedSources);
             BuildRoute(*session, std::move(selectedSources));
@@ -677,12 +689,15 @@ namespace
 
             uint32 routeSize = session->route.size();
             uint32 routeMap = firstPoint.source.mapId;
+            uint32 routeZoneId = session->routeZoneId;
+            AreaTableEntry const* routeZone = sAreaTableStore.LookupEntry(routeZoneId);
+            std::string routeZoneName = routeZone ? PlayerbotAI::GetLocalizedAreaName(routeZone) : "Unknown zone";
             bool passiveNodeGathering = session->passiveNodeGathering;
             _sessions.emplace(bot->GetGUID(), std::move(session));
 
             handler->PSendSysMessage(
-                "Autofarm started for {}: [{}] ({}), {} route points on map {}, sources: {}, goal: {}.",
-                bot->GetName(), itemTemplate->Name1, itemTemplate->ItemId, routeSize, routeMap,
+                "Autofarm started for {}: [{}] ({}), {} route points in {} on map {}, sources: {}, goal: {}.",
+                bot->GetName(), itemTemplate->Name1, itemTemplate->ItemId, routeSize, routeZoneName, routeMap,
                 SourceDescription(sourceMask), goalAmount ? std::to_string(goalAmount) : std::string("unlimited"));
             handler->SendSysMessage("Playerbots combat, recovery, looting, gathering, and skinning are active. "
                 "Usable incidental profession nodes will also be gathered.");
@@ -690,7 +705,7 @@ namespace
                 handler->SendSysMessage("Resting and repetitive buffing are suppressed; health and mana recover "
                     "between fights.");
             if (passiveNodeGathering)
-                handler->SendSysMessage("This mining/herbalism node route ignores NPC aggro.");
+                handler->SendSysMessage("This mining/herbalism node route ignores NPC and player-controlled combat.");
             return true;
         }
 
@@ -748,6 +763,8 @@ namespace
             uint32 currentCount = bot->GetItemCount(session.itemId);
             uint32 gained = currentCount > session.startingCount ? currentCount - session.startingCount : 0;
             uint32 elapsedSeconds = getMSTimeDiff(session.startedAtMs, getMSTime()) / IN_MILLISECONDS;
+            AreaTableEntry const* routeZone = sAreaTableStore.LookupEntry(session.routeZoneId);
+            std::string routeZoneName = routeZone ? PlayerbotAI::GetLocalizedAreaName(routeZone) : "Unknown zone";
             if (uiStatus)
             {
                 RoutePoint const& point = session.route[session.routeIndex];
@@ -804,11 +821,12 @@ namespace
                 };
 
                 handler->PSendSysMessage(
-                    "AFSTATUS|bot={}|state={}|level={}|health={:.0f}|area={}|map={}|x={:.0f}|y={:.0f}|"
+                    "AFSTATUS|bot={}|state={}|level={}|health={:.0f}|area={}|farmzone={}|map={}|x={:.0f}|y={:.0f}|"
                     "item={}|itemid={}|gained={}|goal={}|inventory={}|free={}|route={}|routes={}|loops={}|"
                     "source={}|distance={:.1f}|moving={}|recoveries={}|stalled={}|elapsed={}|rate={}",
                     cleanField(bot->GetName()), cleanField(state), bot->GetLevel(), bot->GetHealthPct(),
-                    cleanField(areaName), bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                    cleanField(areaName), cleanField(routeZoneName), bot->GetMapId(), bot->GetPositionX(),
+                    bot->GetPositionY(),
                     cleanField(session.itemName), session.itemId, gained, session.goalAmount, currentCount,
                     bot->GetFreeInventorySpace(), session.routeIndex + 1, session.route.size(),
                     session.completedLoops, cleanField(sourceName), distance, bot->isMoving() ? 1 : 0,
@@ -817,8 +835,9 @@ namespace
             }
 
             handler->PSendSysMessage(
-                "{} is farming [{}] ({}): gained {}/{}, inventory {}, route {}/{}, loops {}, elapsed {}m {}s.",
-                bot->GetName(), session.itemName, session.itemId, gained,
+                "{} is farming [{}] ({}) in zone {}: gained {}/{}, inventory {}, route {}/{}, loops {}, elapsed {}m "
+                "{}s.",
+                bot->GetName(), session.itemName, session.itemId, routeZoneName, gained,
                 session.goalAmount ? std::to_string(session.goalAmount) : std::string("unlimited"), currentCount,
                 session.routeIndex + 1, session.route.size(), session.completedLoops, elapsedSeconds / 60,
                 elapsedSeconds % 60);
@@ -1063,6 +1082,9 @@ namespace
                     continue;
                 if (!(data.phaseMask & PHASEMASK_NORMAL))
                     continue;
+                if (sPoolMgr->IsPartOfAPool<GameObject>(spawnId) &&
+                    !sPoolMgr->IsSpawnedObject<GameObject>(spawnId))
+                    continue;
 
                 sources.push_back({spawnId, data.id, data.mapid, data.posX, data.posY, data.posZ, data.orientation,
                     SOURCE_GAMEOBJECT});
@@ -1071,68 +1093,159 @@ namespace
             return sources;
         }
 
-        std::vector<SourceSpawn> SelectCluster(Player* bot, std::vector<SourceSpawn> const& sources) const
+        static uint32 GetSourceZoneId(SourceSpawn const& source)
         {
-            std::unordered_map<ClusterKey, std::vector<size_t>, ClusterKeyHash> clusters;
+            return sMapMgr->GetZoneId(PHASEMASK_NORMAL, source.mapId, source.x, source.y, source.z);
+        }
+
+        std::vector<SourceSpawn> SelectZone(Player* bot, std::vector<SourceSpawn> const& sources) const
+        {
+            struct ZoneCandidate
+            {
+                ZoneKey key;
+                float centerX = 0.0f;
+                float centerY = 0.0f;
+                double score = -std::numeric_limits<double>::max();
+                double averageLegDistance = 0.0;
+                double averageGrade = 0.0;
+                float elevationRange = 0.0f;
+                std::vector<size_t> indices;
+            };
+
+            std::unordered_map<ZoneKey, std::vector<size_t>, ZoneKeyHash> zones;
             for (size_t index = 0; index < sources.size(); ++index)
-            {
-                SourceSpawn const& source = sources[index];
-                ClusterKey key;
-                key.mapId = source.mapId;
-                key.x = static_cast<int32>(std::floor(source.x / _config.clusterSize));
-                key.y = static_cast<int32>(std::floor(source.y / _config.clusterSize));
-                clusters[key].push_back(index);
-            }
+                zones[{sources[index].mapId, GetSourceZoneId(sources[index])}].push_back(index);
 
-            ClusterKey bestKey;
+            ZoneCandidate best;
             bool found = false;
-            double bestScore = -std::numeric_limits<double>::max();
-            for (auto const& [key, indices] : clusters)
+            double radiusSquared = static_cast<double>(_config.clusterRadius) * _config.clusterRadius;
+            for (auto const& [zoneKey, zoneIndices] : zones)
             {
-                float centerX = (static_cast<float>(key.x) + 0.5f) * _config.clusterSize;
-                float centerY = (static_cast<float>(key.y) + 0.5f) * _config.clusterSize;
-                double anchorPenalty = FactionAnchorDistance(bot, key.mapId, centerX, centerY);
-                double score = static_cast<double>(indices.size()) * 10000.0 - anchorPenalty * 5.0;
-
-                if (!found || score > bestScore)
+                std::unordered_map<uint64, size_t> cells;
+                for (size_t index : zoneIndices)
                 {
+                    SourceSpawn const& source = sources[index];
+                    int32 cellX = static_cast<int32>(std::floor(source.x / _config.clusterSize));
+                    int32 cellY = static_cast<int32>(std::floor(source.y / _config.clusterSize));
+                    uint64 cellKey = (static_cast<uint64>(static_cast<uint32>(cellX)) << 32) |
+                        static_cast<uint32>(cellY);
+                    ++cells[cellKey];
+                }
+
+                auto bestCell = std::max_element(cells.begin(), cells.end(), [](auto const& left, auto const& right)
+                {
+                    return left.second < right.second;
+                });
+                if (bestCell == cells.end())
+                    continue;
+
+                int32 cellX = static_cast<int32>(bestCell->first >> 32);
+                int32 cellY = static_cast<int32>(bestCell->first & 0xFFFFFFFF);
+                ZoneCandidate candidate;
+                candidate.key = zoneKey;
+                candidate.centerX = (static_cast<float>(cellX) + 0.5f) * _config.clusterSize;
+                candidate.centerY = (static_cast<float>(cellY) + 0.5f) * _config.clusterSize;
+                for (size_t index : zoneIndices)
+                {
+                    SourceSpawn const& source = sources[index];
+                    if (SquaredDistance(source.x, source.y, candidate.centerX, candidate.centerY) <= radiusSquared)
+                        candidate.indices.push_back(index);
+                }
+                if (candidate.indices.empty())
+                    continue;
+                if (candidate.indices.size() > _config.maxRoutePoints)
+                {
+                    std::sort(candidate.indices.begin(), candidate.indices.end(), [&sources, &candidate](
+                        size_t left, size_t right)
+                    {
+                        SourceSpawn const& leftSource = sources[left];
+                        SourceSpawn const& rightSource = sources[right];
+                        return SquaredDistance(leftSource.x, leftSource.y, candidate.centerX, candidate.centerY) <
+                            SquaredDistance(rightSource.x, rightSource.y, candidate.centerX, candidate.centerY);
+                    });
+                    candidate.indices.resize(_config.maxRoutePoints);
+                }
+
+                double nearestDistanceSum = 0.0;
+                double nearestGradeSum = 0.0;
+                float minimumZ = std::numeric_limits<float>::max();
+                float maximumZ = std::numeric_limits<float>::lowest();
+                for (size_t index : candidate.indices)
+                {
+                    SourceSpawn const& source = sources[index];
+                    minimumZ = std::min(minimumZ, source.z);
+                    maximumZ = std::max(maximumZ, source.z);
+
+                    double nearestDistance = _config.clusterRadius;
+                    double nearestGrade = 1.0;
+                    for (size_t otherIndex : candidate.indices)
+                    {
+                        if (index == otherIndex)
+                            continue;
+
+                        SourceSpawn const& other = sources[otherIndex];
+                        double distance = std::sqrt(SquaredDistance(source.x, source.y, other.x, other.y));
+                        if (distance >= nearestDistance)
+                            continue;
+
+                        nearestDistance = distance;
+                        nearestGrade = std::abs(static_cast<double>(source.z - other.z)) /
+                            std::max(1.0, distance);
+                    }
+                    nearestDistanceSum += nearestDistance;
+                    nearestGradeSum += nearestGrade;
+                }
+
+                candidate.averageLegDistance = nearestDistanceSum / candidate.indices.size();
+                candidate.averageGrade = nearestGradeSum / candidate.indices.size();
+                candidate.elevationRange = maximumZ - minimumZ;
+                double terrainMultiplier = 1.0 + std::min(1.0, candidate.averageGrade) * 8.0;
+                double navigationCost = std::max(40.0, candidate.averageLegDistance) * terrainMultiplier +
+                    candidate.elevationRange * 0.4;
+                size_t effectiveCount = std::min<size_t>(candidate.indices.size(), _config.maxRoutePoints);
+                double productivity = static_cast<double>(effectiveCount) * 1000.0 / navigationCost;
+                double anchorPenalty = FactionAnchorDistance(bot, zoneKey.mapId, candidate.centerX,
+                    candidate.centerY) / 10000.0;
+                candidate.score = productivity - anchorPenalty;
+
+                if (!found || candidate.score > best.score)
+                {
+                    best = std::move(candidate);
                     found = true;
-                    bestKey = key;
-                    bestScore = score;
                 }
             }
 
             if (!found)
                 return {};
 
-            float centerX = (static_cast<float>(bestKey.x) + 0.5f) * _config.clusterSize;
-            float centerY = (static_cast<float>(bestKey.y) + 0.5f) * _config.clusterSize;
-            double radiusSquared = static_cast<double>(_config.clusterRadius) * _config.clusterRadius;
-
             std::vector<SourceSpawn> selected;
-            for (SourceSpawn const& source : sources)
-            {
-                if (source.mapId != bestKey.mapId)
-                    continue;
-                if (SquaredDistance(source.x, source.y, centerX, centerY) <= radiusSquared)
-                    selected.push_back(source);
-            }
+            selected.reserve(best.indices.size());
+            for (size_t index : best.indices)
+                selected.push_back(sources[index]);
 
             if (selected.size() > _config.maxRoutePoints)
             {
-                std::sort(selected.begin(), selected.end(), [centerX, centerY](SourceSpawn const& left,
+                std::sort(selected.begin(), selected.end(), [&best](SourceSpawn const& left,
                     SourceSpawn const& right)
                 {
-                    return SquaredDistance(left.x, left.y, centerX, centerY) <
-                        SquaredDistance(right.x, right.y, centerX, centerY);
+                    return SquaredDistance(left.x, left.y, best.centerX, best.centerY) <
+                        SquaredDistance(right.x, right.y, best.centerX, best.centerY);
                 });
                 selected.resize(_config.maxRoutePoints);
             }
 
+            if (_config.debug)
+            {
+                LOG_DEBUG("module.autofarm",
+                    "Selected zone {} on map {} with {} sources, average leg {:.1f}, grade {:.3f}, elevation {:.1f}",
+                    best.key.zoneId, best.key.mapId, selected.size(), best.averageLegDistance, best.averageGrade,
+                    best.elevationRange);
+            }
+
             std::vector<SourceSpawn> ordered;
             ordered.reserve(selected.size());
-            float currentX = centerX;
-            float currentY = centerY;
+            float currentX = best.centerX;
+            float currentY = best.centerY;
             while (!selected.empty())
             {
                 auto nearest = std::min_element(selected.begin(), selected.end(), [currentX, currentY](
@@ -1389,6 +1502,7 @@ namespace
                 {"loot", true},
                 {"gather", true},
                 {"travel", true},
+                {"mount", true},
                 {"follow", false},
                 {"stay", false},
                 {"rpg", false},
@@ -1433,26 +1547,55 @@ namespace
                 bot->SetImmuneToNPC(true);
                 session.npcImmunityApplied = true;
             }
+            if (!bot->IsImmuneToPC())
+            {
+                bot->SetImmuneToPC(true);
+                session.pcImmunityApplied = true;
+            }
 
-            ApplyPetNpcImmunity(bot, session);
+            SuppressFlightCombatStrategies(botAI, session);
+            ClearPassiveCombatTargets(botAI);
+            ApplyPetImmunity(bot, session);
         }
 
-        static void ApplyPetNpcImmunity(Player* bot, FarmSession& session)
+        static void ApplyPetImmunity(Player* bot, FarmSession& session)
         {
             Pet* pet = bot->GetPet();
             if (!pet || pet->GetGUID() == session.petGuid)
                 return;
 
-            if (session.petNpcImmunityApplied && !session.petGuid.IsEmpty())
+            if (!session.petGuid.IsEmpty())
             {
                 if (Pet* previousPet = ObjectAccessor::GetPet(*bot, session.petGuid))
-                    previousPet->SetImmuneToNPC(false);
+                {
+                    if (session.petNpcImmunityApplied)
+                        previousPet->SetImmuneToNPC(false);
+                    if (session.petPcImmunityApplied)
+                        previousPet->SetImmuneToPC(false);
+                }
             }
 
             session.petGuid = pet->GetGUID();
             session.petNpcImmunityApplied = !pet->IsImmuneToNPC();
+            session.petPcImmunityApplied = !pet->IsImmuneToPC();
             if (session.petNpcImmunityApplied)
                 pet->SetImmuneToNPC(true);
+            if (session.petPcImmunityApplied)
+                pet->SetImmuneToPC(true);
+        }
+
+        static void ClearPassiveCombatTargets(PlayerbotAI* botAI)
+        {
+            Player* bot = botAI->GetBot();
+            if (bot->GetVictim())
+                bot->AttackStop();
+
+            auto* context = botAI->GetAiObjectContext();
+            context->GetValue<Unit*>("current target")->Set(nullptr);
+            context->GetValue<Unit*>("enemy player target")->Set(nullptr);
+            context->GetValue<Unit*>("dps target")->Set(nullptr);
+            context->GetValue<ObjectGuid>("pull target")->Reset();
+            context->GetValue<GuidVector>("prioritized targets")->Set({});
         }
 
         void MaintainPlayerOverrides(PlayerbotAI* botAI, FarmSession& session) const
@@ -1490,7 +1633,11 @@ namespace
             {
                 if (!bot->IsImmuneToNPC())
                     bot->SetImmuneToNPC(true);
-                ApplyPetNpcImmunity(bot, session);
+                if (!bot->IsImmuneToPC())
+                    bot->SetImmuneToPC(true);
+                SuppressFlightCombatStrategies(botAI, session);
+                ClearPassiveCombatTargets(botAI);
+                ApplyPetImmunity(bot, session);
             }
         }
 
@@ -1499,16 +1646,25 @@ namespace
             if (!bot)
                 return;
 
-            if (session.petNpcImmunityApplied && !session.petGuid.IsEmpty())
+            if (!session.petGuid.IsEmpty())
             {
                 if (Pet* pet = ObjectAccessor::GetPet(*bot, session.petGuid))
-                    pet->SetImmuneToNPC(false);
+                {
+                    if (session.petNpcImmunityApplied)
+                        pet->SetImmuneToNPC(false);
+                    if (session.petPcImmunityApplied)
+                        pet->SetImmuneToPC(false);
+                }
             }
             session.petNpcImmunityApplied = false;
+            session.petPcImmunityApplied = false;
 
             if (session.npcImmunityApplied)
                 bot->SetImmuneToNPC(false);
             session.npcImmunityApplied = false;
+            if (session.pcImmunityApplied)
+                bot->SetImmuneToPC(false);
+            session.pcImmunityApplied = false;
         }
 
         static void RestoreStrategies(PlayerbotAI* botAI, FarmSession& session)
@@ -1537,6 +1693,13 @@ namespace
             if (!botAI || session.route.empty())
                 return;
 
+            session.nodeApproachActive = false;
+            if (session.passiveNodeGathering)
+            {
+                SetStrategy(botAI, "travel", BOT_STATE_NON_COMBAT, true);
+                SetStrategy(botAI, "mount", BOT_STATE_NON_COMBAT, true);
+            }
+
             RoutePoint& point = session.route[session.routeIndex];
             TravelTarget* target = botAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
             if (!target)
@@ -1547,6 +1710,7 @@ namespace
             target->setExpireIn(HOUR * IN_MILLISECONDS);
             session.pointStartedAtMs = getMSTime();
             session.interactionStartedAtMs = 0;
+            session.sourceUnavailableStartedAtMs = 0;
             session.lastRouteDistance = std::numeric_limits<float>::max();
             session.lastRouteProgressAtMs = session.pointStartedAtMs;
             session.stuckRecoveryAttempts = 0;
@@ -1560,6 +1724,21 @@ namespace
                     botAI->GetBot()->GetName(), session.routeIndex + 1, session.route.size(), point.source.mapId,
                     point.source.x, point.source.y, point.source.z, point.source.entry, point.source.spawnId);
             }
+        }
+
+        static void BeginNodeApproach(PlayerbotAI* botAI, FarmSession& session)
+        {
+            if (session.nodeApproachActive)
+                return;
+
+            session.nodeApproachActive = true;
+            SetStrategy(botAI, "travel", BOT_STATE_NON_COMBAT, false);
+            SetStrategy(botAI, "mount", BOT_STATE_NON_COMBAT, false);
+
+            Player* bot = botAI->GetBot();
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+            botAI->GetAiObjectContext()->GetValue<LastMovement&>("last movement")->Get().clear();
         }
 
         void AdvanceRoute(PlayerbotAI* botAI, FarmSession& session)
@@ -1639,19 +1818,9 @@ namespace
             bot->StopMoving();
             botAI->GetAiObjectContext()->GetValue<LastMovement&>("last movement")->Get().clear();
 
-            if (session.stuckRecoveryAttempts >= AUTOFARM_RETRIES_BEFORE_TELEPORT)
+            if (session.stuckRecoveryAttempts >= AUTOFARM_RETRIES_BEFORE_SKIP)
             {
-                if (_config.teleportToRoute && bot->TeleportTo(point.source.mapId, point.source.x, point.source.y,
-                    point.source.z, point.source.orientation))
-                {
-                    LOG_WARN("module.autofarm",
-                        "Bot {} remained stalled at route point {}/{}; teleported to the source on map {}",
-                        bot->GetName(), session.routeIndex + 1, session.route.size(), point.source.mapId);
-                    session.stuckRecoveryAttempts = 0;
-                    return true;
-                }
-
-                LOG_WARN("module.autofarm", "Bot {} could not recover route point {}/{}; skipping it",
+                LOG_WARN("module.autofarm", "Bot {} could not safely path to route point {}/{}; skipping it",
                     bot->GetName(), session.routeIndex + 1, session.route.size());
                 AdvanceRoute(botAI, session);
                 return true;
@@ -1662,6 +1831,50 @@ namespace
             LOG_WARN("module.autofarm", "Bot {} stalled {:.1f} yards from route point {}/{}; forced path {}",
                 bot->GetName(), distance, session.routeIndex + 1, session.route.size(),
                 movementStarted ? "started" : "could not start");
+            return true;
+        }
+
+        bool RecoverUnsafeGroundPosition(PlayerbotAI* botAI, FarmSession& session)
+        {
+            Player* bot = botAI->GetBot();
+            if (!session.passiveNodeGathering || IsFlightTravelReady(bot) || bot->IsBeingTeleported())
+                return false;
+
+            float allowedZ = bot->GetPositionZ();
+            bot->UpdateAllowedPositionZ(bot->GetPositionX(), bot->GetPositionY(), allowedZ);
+
+            bool belowGround = bot->GetPositionZ() + 2.0f < allowedZ;
+            bool fallingFar = bot->HasUnitMovementFlag(MOVEMENTFLAG_FALLING_FAR) &&
+                bot->GetPositionZ() > allowedZ + 20.0f;
+            if (!belowGround && !fallingFar)
+            {
+                if (!bot->HasUnitMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR) &&
+                    std::abs(bot->GetPositionZ() - allowedZ) <= 3.0f)
+                {
+                    session.lastSafeLocation = WorldLocation(bot->GetMapId(), bot->GetPositionX(),
+                        bot->GetPositionY(), bot->GetPositionZ(), bot->GetOrientation());
+                    session.hasLastSafeLocation = true;
+                }
+                return false;
+            }
+
+            bool useLastSafeLocation = session.hasLastSafeLocation &&
+                session.lastSafeLocation.GetMapId() == bot->GetMapId();
+            float rescueX = useLastSafeLocation ? session.lastSafeLocation.GetPositionX() : bot->GetPositionX();
+            float rescueY = useLastSafeLocation ? session.lastSafeLocation.GetPositionY() : bot->GetPositionY();
+            float rescueZ = useLastSafeLocation ? session.lastSafeLocation.GetPositionZ() : allowedZ + 1.0f;
+            float rescueOrientation = useLastSafeLocation ? session.lastSafeLocation.GetOrientation() :
+                bot->GetOrientation();
+
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+            bot->RemoveUnitMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
+            botAI->GetAiObjectContext()->GetValue<LastMovement&>("last movement")->Get().clear();
+            bot->NearTeleportTo(rescueX, rescueY, rescueZ, rescueOrientation, false, false, true);
+            SetTravelTarget(botAI, session);
+
+            LOG_WARN("module.autofarm", "Bot {} entered unsafe ground movement; returned to its last safe position",
+                bot->GetName());
             return true;
         }
 
@@ -1677,7 +1890,10 @@ namespace
 
             MaintainPlayerOverrides(botAI, session);
 
-            if (!IsFlightTravelReady(bot))
+            if (RecoverUnsafeGroundPosition(botAI, session))
+                return std::nullopt;
+
+            if (!IsFlightTravelReady(bot) && !session.passiveNodeGathering)
                 RestoreFlightCombatStrategies(botAI, session);
 
             if (!bot->IsAlive() || bot->HasPlayerFlag(PLAYER_FLAGS_GHOST))
@@ -1740,15 +1956,20 @@ namespace
             {
                 if (UpdateFlightTravel(botAI, session, point, now))
                     return std::nullopt;
-                RestoreFlightCombatStrategies(botAI, session);
+                if (!session.passiveNodeGathering)
+                    RestoreFlightCombatStrategies(botAI, session);
             }
 
             bool farmCreatureEngaged = IsFarmCreatureEngaged(bot, point);
             if (bot->IsInCombat() && !farmCreatureEngaged)
                 return std::nullopt;
 
+            bool gameObjectPoint = point.source.sourceMask & SOURCE_GAMEOBJECT;
+            if (session.passiveNodeGathering && gameObjectPoint && distance <= 35.0f)
+                BeginNodeApproach(botAI, session);
+
             bool needsRouteProgress = distance > 35.0f ||
-                ((point.source.sourceMask & SOURCE_GAMEOBJECT) && distance > AUTOFARM_INTERACTION_DISTANCE);
+                (gameObjectPoint && distance > AUTOFARM_INTERACTION_DISTANCE);
             if (needsRouteProgress && RecoverStalledRoute(botAI, session, point, distance, now))
                 return std::nullopt;
 
@@ -1768,7 +1989,7 @@ namespace
                 return std::nullopt;
             }
 
-            if (point.source.sourceMask & SOURCE_GAMEOBJECT)
+            if (gameObjectPoint)
                 ProcessGameObjectPoint(botAI, session, point);
             else
                 ProcessCreaturePoint(botAI, session, point);
@@ -1790,6 +2011,7 @@ namespace
             if (bot->GetDistance(gameObject) > AUTOFARM_INTERACTION_DISTANCE)
             {
                 session.interactionStartedAtMs = 0;
+                session.sourceUnavailableStartedAtMs = 0;
                 AutofarmMovementAction movement(botAI);
                 movement.MoveToTarget(gameObject);
                 return;
@@ -1798,9 +2020,14 @@ namespace
             LootObject loot(bot, gameObject->GetGUID());
             if (loot.IsEmpty() || !loot.IsLootPossible(bot))
             {
-                AdvanceRoute(botAI, session);
+                uint32 now = getMSTime();
+                if (!session.sourceUnavailableStartedAtMs)
+                    session.sourceUnavailableStartedAtMs = now;
+                else if (getMSTimeDiff(session.sourceUnavailableStartedAtMs, now) >= AUTOFARM_NODE_RETRY_MS)
+                    AdvanceRoute(botAI, session);
                 return;
             }
+            session.sourceUnavailableStartedAtMs = 0;
 
             uint32 now = getMSTime();
             if (!session.interactionStartedAtMs)

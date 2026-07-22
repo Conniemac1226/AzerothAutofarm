@@ -2,9 +2,9 @@
 
 `mod-autofarm` lets an owned playerbot farm a selected raw material without hardcoded zone or item lists. It uses the
 live AzerothCore item, loot, creature, gameobject, and spawn stores to locate outdoor sources, chooses a productive
-faction-aware cluster, teleports to the route, and lets `mod-playerbots` handle movement, combat, looting, gathering,
-skinning, and death recovery. While a session is active, food/drink downtime and repetitive buff refreshes are
-suppressed; health and mana are restored between fights instead.
+navigation-friendly single-zone route, teleports to it, and lets `mod-playerbots` handle movement, combat, looting,
+gathering, skinning, and death recovery. While a session is active, food/drink downtime and repetitive buff refreshes
+are suppressed; health and mana are restored between fights instead.
 
 ## Requirements
 
@@ -57,20 +57,27 @@ The quantity is the number newly collected during that session. Omit `--count` o
 
 ## Farming behavior
 
+- Every session chooses exactly one zone and remains there. Candidate zones are ranked by usable source density,
+  average distance between nearby sources, terrain grade, and total elevation range, with a small faction-location
+  preference. The route therefore favors a compact, flatter zone over a larger but difficult mountain route.
 - Ore and herbs: routes through nodes that directly contain the requested item.
 - Cloth and meat: routes through suitable normal creatures whose corpse loot contains the requested item.
 - Leather and scales: routes through suitable skinnable creatures.
 - Elemental mining/herbalism and other gatherable raw items: uses the creature's required loot skill.
 - Fishing schools and other usable outdoor gameobjects: supported when the item is in the object's loot template.
 - Incidental resources: while targeting copper, any usable nearby mining/herbalism node such as tin is still gathered.
-- Mining and herbalism node routes temporarily make the bot and its active pet immune to NPC aggro. The character
-  remains visible to players and can continue interacting with nodes.
+- Mining and herbalism node routes temporarily make the bot and its active pet immune to NPC and player-controlled
+  combat. The character remains visible to players and can continue interacting with nodes.
 - Creature corpses are fully looted and skinned when the character has the required profession.
 - Combat, attackers encountered on the route, death, and recovery are handled by the bot's normal class AI.
 - Food, drink, random grinding, and repetitive non-combat buffing are disabled during autofarm. Health and mana are
   restored out of combat, and all affected playerbot strategies return to their original state when farming stops.
 - Active sessions clear the AFK flag and periodically refresh the server activity timeout. This is the server-side
   equivalent of input for a playerbot, which has no client keyboard or network socket of its own.
+- Inactive members of mining/herbalism spawn pools are removed when a route is built, reducing travel toward nodes that
+  cannot currently spawn. Unreachable points are skipped instead of teleporting the bot into raw spawn coordinates.
+- Near a node, autofarm temporarily owns travel and mounting so loot cannot fight a simultaneous remount. Unsafe ground
+  movement returns the bot to its last valid position before it can fall through terrain.
 - In Outland and Northrend, a bot with usable flying automatically takes off, cruises above sampled terrain, and lands
   at the selected source. Unrelated attackers do not make it dismount; if it is forced off the mount, its original
   combat strategies are restored so it can defend itself.
@@ -86,8 +93,8 @@ requiring a module update.
 - Instance maps are never selected, even if added to `Autofarm.AllowedMaps`.
 - The selected item is temporarily forced into the playerbot always-loot list.
 - Travel, loot, gather, grind, food, and buff strategies are restored to their previous state on stop.
-- NPC immunity is limited to routes made entirely from mining/herbalism gameobjects and is removed on stop unless the
-  bot or pet already had it.
+- NPC/player immunity and combat suppression are limited to routes made entirely from mining/herbalism gameobjects and
+  are removed on stop unless the bot or pet already had the relevant immunity.
 - Sessions are in memory. A worldserver restart stops all farming sessions.
 - Crafted-only items, vendor items, open-water fishing drops, and items found only inside containers are not direct farm
   sources in the first version.

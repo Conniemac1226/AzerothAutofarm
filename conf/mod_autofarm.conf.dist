@@ -23,9 +23,9 @@ Autofarm.ReturnOnStop = 1
 # Default: 1
 Autofarm.SuppressRestAndBuffs = 1
 
-# Make bots and their active pets immune to NPC aggro on routes made entirely from mining or herbalism nodes.
-# This does not hide them from players, prevent node interaction, or affect creature-loot/skinning routes.
-# The prior NPC-immunity state is restored when the session stops.
+# Make bots and their active pets immune to NPC and player-controlled combat on routes made entirely from mining or
+# herbalism nodes. This does not hide them from players, prevent node interaction, or affect creature-loot/skinning
+# routes. Prior immunity states and combat strategies are restored when the session stops.
 # Default: 1
 Autofarm.PassiveNodeGathering = 1
 
@@ -55,11 +55,11 @@ Autofarm.FlightCombatEscapeMs = 6000
 # Default: "0,1,530,571"
 Autofarm.AllowedMaps = "0,1,530,571"
 
-# Size of the cells used to find a productive cluster of item sources, in yards.
+# Size of the cells used to find a productive compact route inside each candidate zone, in yards.
 # Default: 1800
 Autofarm.ClusterSize = 1800
 
-# Include source spawns this far from the selected cluster center, in yards.
+# Include source spawns this far from the selected center without crossing the selected zone boundary, in yards.
 # Default: 2800
 Autofarm.ClusterRadius = 2800
 
