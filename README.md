@@ -6,6 +6,10 @@ navigation-friendly single-zone route, teleports to it, and lets `mod-playerbots
 gathering, skinning, and death recovery. While a session is active, food/drink downtime and repetitive buff refreshes
 are suppressed; health and mana are restored between fights instead.
 
+It can also farm Vanilla reputation that is awarded directly by outdoor creature kills. Reputation targets, team
+restrictions, reward values, and maximum standings come from the live `creature_onkill_reputation` data rather than a
+hardcoded faction or creature list.
+
 ## Requirements
 
 - AzerothCore WotLK
@@ -22,9 +26,10 @@ that is logged in by the server as a playerbot, so it is neither required nor us
 
 The WotLK 3.3.5a `AzerothAutofarm` addon in `client/AzerothAutofarm/` provides a standalone graphical control panel for
 the commands below. It includes material presets, custom item/link input, favorites, quantity goals, bot selection,
-session controls, an activity log, help, and a minimap button. It has no external addon dependencies and does not
-perform movement or combat; it sends requests to this server module. Its main, Activity, and Help windows automatically
-scale to fit the current display resolution and UI scale.
+reputation starts, session controls, an activity log, help, and a minimap button. The Activity window adapts its
+progress, standing, and rate fields for reputation sessions. It has no external addon dependencies and does not perform
+movement or combat; it sends requests to this server module. Its main, Activity, and Help windows automatically scale
+to fit the current display resolution and UI scale.
 
 ## Commands
 
@@ -57,6 +62,24 @@ Find item IDs when a partial name is ambiguous:
 
 The quantity is the number newly collected during that session. Omit `--count` or use zero for an unlimited session.
 
+Farm Vanilla mob-kill reputation with the current character or an added playerbot:
+
+```text
+.autofarm rep Argent Dawn
+.autofarm rep Timbermaw Hold --standing revered
+.autofarm repbot CharacterName Cenarion Circle --standing exalted
+.autofarm repsearch argent
+```
+
+When `--standing` is omitted, the module targets the highest standing supported by an eligible mob for that faction.
+Explicit standing names are `hated`, `hostile`, `unfriendly`, `neutral`, `friendly`, `honored`, `revered`, and
+`exalted`. Existing `.autofarm status`, `.autofarm stop`, and `.autofarm stopall` commands work for both material and
+reputation sessions.
+
+The Vanilla reputation mode deliberately starts with outdoor Eastern Kingdoms and Kalimdor kill rewards. It does not
+enter instances, complete quests, use repeatable turn-ins, or farm a reputation whose only source is one of those
+activities. A normally friendly target must already be attackable, such as by marking its faction At War.
+
 ## Farming behavior
 
 - Every session chooses exactly one zone and remains there. Candidate zones are ranked by usable source density,
@@ -74,6 +97,9 @@ The quantity is the number newly collected during that session. Omit `--count` o
 - Mining and herbalism node routes temporarily make the bot and its active pet immune to NPC and player-controlled
   combat. The character remains visible to players and can continue interacting with nodes.
 - Creature corpses are fully looted and skinned when the character has the required profession.
+- Reputation routes attack level-appropriate non-world-boss creatures whose direct kill reward can reach the requested
+  standing. Elite targets are supported because some reputations require them. The session stops as soon as that
+  standing is reached and does not require free inventory space.
 - Combat, attackers encountered on the route, death, and recovery are handled by the bot's normal class AI.
 - Food, drink, random grinding, and repetitive non-combat buffing are disabled during autofarm. Health and mana are
   restored out of combat, and all affected playerbot strategies return to their original state when farming stops.
@@ -99,7 +125,8 @@ requiring a module update.
 - Starting on the currently played character automatically enables selfbot. Autofarm disables it on stop only when the
   module enabled it; a selfbot that was already enabled manually is left enabled.
 - Battlegrounds, arenas, instances, taxis, combat starts, dead starts, and teleports already in progress are rejected.
-- Deliberate creature targets are limited to normal creatures at a configurable level range.
+- Material-route creature targets are limited to normal creatures at a configurable level range. Reputation routes
+  may include elite creatures but never world bosses.
 - Instance maps are never selected, even if added to `Autofarm.AllowedMaps`.
 - The selected item is temporarily forced into the playerbot always-loot list.
 - Travel, loot, gather, grind, food, and buff strategies are restored to their previous state on stop.

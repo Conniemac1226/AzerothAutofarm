@@ -412,6 +412,28 @@ function AF:StartFarm()
     self:SendCommand(command, "Starting farm route; waiting for the server...")
 end
 
+function AF:StartReputation()
+    local factionText = Trim(self.itemBox:GetText()):gsub("[\r\n]", " ")
+    if factionText == "" then
+        self:SetActivity("Enter a reputation faction name or ID.", "error")
+        self:Print("Enter a reputation faction before starting.")
+        return
+    end
+
+    local botName = self:CleanBotName()
+    local command
+    if botName ~= "" then
+        command = ".autofarm repbot " .. botName .. " " .. factionText
+    else
+        command = ".autofarm rep " .. factionText
+    end
+
+    self.db.botName = botName
+    self.db.itemText = factionText
+    self.statusUnavailable = false
+    self:SendCommand(command, "Starting reputation route; waiting for the server...")
+end
+
 function AF:RequestStatus(silent)
     local botName = self:CleanBotName()
     local command = ".autofarm statusui"
@@ -712,11 +734,21 @@ function AF:RefreshActivityDashboard()
     local reroutes = tonumber(status.reroutes) or 0
     local stalled = tonumber(status.stalled) or 0
 
-    self.activityMaterial:SetText((status.item or "Unknown") .. "  •  item " .. (status.itemid or "?"))
-    self.activityProgress:SetText(
-        FormatNumber(status.gained) .. " / " .. goalText .. " gained  •  "
-        .. FormatNumber(status.inventory) .. " carried"
-    )
+    local reputationMode = status.mode == "reputation"
+    if reputationMode then
+        self.activityMaterial:SetText(
+            (status.faction or status.item or "Unknown") .. "  •  faction " .. (status.factionid or "?")
+        )
+        self.activityProgress:SetText(
+            FormatNumber(status.gained) .. " / " .. goalText .. " reputation  •  " .. (status.standing or "Unknown")
+        )
+    else
+        self.activityMaterial:SetText((status.item or "Unknown") .. "  •  item " .. (status.itemid or "?"))
+        self.activityProgress:SetText(
+            FormatNumber(status.gained) .. " / " .. goalText .. " gained  •  "
+            .. FormatNumber(status.inventory) .. " carried"
+        )
+    end
     self.activityRoute:SetText(
         "Point " .. (status.route or "?") .. " / " .. (status.routes or "?")
         .. "  •  " .. FormatNumber(status.loops) .. " loops"
@@ -730,10 +762,13 @@ function AF:RefreshActivityDashboard()
         .. "  •  selfbot " .. (status.selfbot or "existing")
     )
     self.activityVitals:SetText(
-        (status.health or "0") .. "% health  •  " .. FormatNumber(status.free) .. " free bag slots"
+        (status.health or "0") .. "% health  •  "
+        .. (reputationMode and (FormatNumber(status.inventory) .. " current reputation")
+            or (FormatNumber(status.free) .. " free bag slots"))
     )
     self.activityTime:SetText(
-        FormatDuration(status.elapsed) .. " elapsed  •  " .. FormatNumber(status.rate) .. " items/hour"
+        FormatDuration(status.elapsed) .. " elapsed  •  " .. FormatNumber(status.rate)
+        .. (reputationMode and " reputation/hour" or " items/hour")
     )
     self.activityMovement:SetText(
         movementText .. "  •  " .. recoveries .. " current retries  •  "
@@ -762,11 +797,12 @@ function AF:HandleStatusTelemetry(message)
         status.bot or "", status.state or "", status.gained or "", status.route or "", status.recoveries or "",
         status.reroutes or ""
     }, "|")
+    local progressNoun = status.mode == "reputation" and " reputation" or " gathered"
     if summaryKey ~= self.lastStatusLogKey then
         self.lastStatusLogKey = summaryKey
         self:AddLog(
             (status.bot or "Bot") .. ": " .. (status.state or "Unknown")
-            .. ", " .. FormatNumber(status.gained) .. " gathered, route "
+            .. ", " .. FormatNumber(status.gained) .. progressNoun .. ", route "
             .. (status.route or "?") .. "/" .. (status.routes or "?"),
             "success"
         )
@@ -774,7 +810,7 @@ function AF:HandleStatusTelemetry(message)
 
     self:SetActivity(
         (status.bot or "Bot") .. " — " .. (status.state or "active")
-        .. ", " .. FormatNumber(status.gained) .. " gathered",
+        .. ", " .. FormatNumber(status.gained) .. progressNoun,
         "success"
     )
     return true
@@ -1063,28 +1099,33 @@ end
 
 function AF:CreateMinimapButton()
     local button = CreateFrame("Button", "AzerothAutofarmMinimapButton", Minimap)
-    button:SetSize(32, 32)
+    button:SetWidth(32)
+    button:SetHeight(32)
     button:SetFrameStrata("MEDIUM")
     button:SetFrameLevel(8)
     button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     button:RegisterForDrag("LeftButton")
+    button:SetClampedToScreen(true)
 
-    local icon = button:CreateTexture(nil, "BACKGROUND")
+    local icon = button:CreateTexture(nil, "ARTWORK")
     icon:SetTexture("Interface\\Icons\\Trade_Mining")
-    icon:SetSize(20, 20)
-    icon:SetPoint("CENTER")
+    icon:SetWidth(20)
+    icon:SetHeight(20)
+    icon:SetPoint("CENTER", button, "CENTER", 0, 0)
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
     local border = button:CreateTexture(nil, "OVERLAY")
     border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
-    border:SetSize(54, 54)
-    border:SetPoint("TOPLEFT", -11, 11)
+    border:SetWidth(53)
+    border:SetHeight(53)
+    -- This texture contains its own transparent inset. Anchor it at the button origin; applying a visual
+    -- half-size offset makes the ring detach from the icon in minimap-button collectors such as ElvUI.
+    border:SetPoint("TOPLEFT", button, "TOPLEFT", 0, 0)
 
     local highlight = button:CreateTexture(nil, "HIGHLIGHT")
     highlight:SetTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
     highlight:SetBlendMode("ADD")
-    highlight:SetSize(32, 32)
-    highlight:SetPoint("CENTER")
+    highlight:SetAllPoints(button)
 
     button:SetScript("OnClick", function(_, mouseButton)
         if mouseButton == "RightButton" then
@@ -1466,7 +1507,7 @@ function AF:CreateMainFrame()
 
     local itemTitle = actionPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     itemTitle:SetPoint("TOPLEFT", 14, -10)
-    itemTitle:SetText("ITEM NAME, ID, OR LINK")
+    itemTitle:SetText("ITEM, LINK, OR REPUTATION FACTION")
     SetFontColor(itemTitle, COLORS.muted)
 
     local itemBox = CreateEditBox(actionPanel, 298, 29, "Choose a preset or enter a custom item")
@@ -1506,12 +1547,23 @@ function AF:CreateMainFrame()
     SetFontColor(selectedMeta, COLORS.dim)
     self.selectedMeta = selectedMeta
 
-    local startButton = CreateButton(actionPanel, "Start Farming", 126, 33, "primary")
+    local startButton = CreateButton(actionPanel, "Start Items", 112, 33, "primary")
     startButton:SetPoint("TOPRIGHT", -14, -16)
     startButton:SetScript("OnClick", function()
         self:StartFarm()
     end)
     AddTooltip(startButton, "Start farming", "Build a route and begin farming the selected material.")
+
+    local reputationButton = CreateButton(actionPanel, "Start Rep", 96, 33, "primary")
+    reputationButton:SetPoint("RIGHT", startButton, "LEFT", -7, 0)
+    reputationButton:SetScript("OnClick", function()
+        self:StartReputation()
+    end)
+    AddTooltip(
+        reputationButton,
+        "Start reputation farming",
+        "Enter a faction name or ID in the field. You may append --standing revered (or another standing)."
+    )
 
     local statusButton = CreateButton(actionPanel, "Status", 75, 28)
     statusButton:SetPoint("BOTTOMRIGHT", -14, 12)

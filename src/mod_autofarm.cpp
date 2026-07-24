@@ -29,6 +29,7 @@
 #include "PlayerScript.h"
 #include "Playerbots.h"
 #include "PoolMgr.h"
+#include "ReputationMgr.h"
 #include "ScriptMgr.h"
 #include "StringFormat.h"
 #include "Timer.h"
@@ -36,6 +37,7 @@
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cctype>
 #include <cmath>
@@ -59,6 +61,7 @@ namespace
     constexpr uint8 SOURCE_GAMEOBJECT = 0x01;
     constexpr uint8 SOURCE_CREATURE_LOOT = 0x02;
     constexpr uint8 SOURCE_CREATURE_SKIN = 0x04;
+    constexpr uint8 SOURCE_REPUTATION = 0x08;
     constexpr float AUTOFARM_INTERACTION_DISTANCE = INTERACTION_DISTANCE - 2.0f;
     constexpr float AUTOFARM_PROGRESS_DISTANCE = 1.0f;
     constexpr float AUTOFARM_FLIGHT_APPROACH_DISTANCE = 28.0f;
@@ -78,6 +81,12 @@ namespace
         Cruise,
         Landing,
         Evading
+    };
+
+    enum class FarmMode : uint8
+    {
+        Item,
+        Reputation
     };
 
     struct AutofarmConfig
@@ -233,11 +242,16 @@ namespace
     {
         ObjectGuid botGuid;
         ObjectGuid ownerGuid;
+        FarmMode mode = FarmMode::Item;
         uint32 itemId = 0;
+        uint32 factionId = 0;
         uint32 routeZoneId = 0;
         std::string itemName;
         uint32 goalAmount = 0;
         uint32 startingCount = 0;
+        int32 startingReputation = 0;
+        int32 targetReputation = 0;
+        ReputationRank targetReputationRank = REP_EXALTED;
         uint32 startedAtMs = 0;
         uint32 pointStartedAtMs = 0;
         uint32 interactionStartedAtMs = 0;
@@ -362,6 +376,43 @@ namespace
         return !itemText.empty();
     }
 
+    char const* ReputationRankName(ReputationRank rank)
+    {
+        static std::array<char const*, MAX_REPUTATION_RANK> const names =
+        {
+            "Hated", "Hostile", "Unfriendly", "Neutral", "Friendly", "Honored", "Revered", "Exalted"
+        };
+        return rank < MAX_REPUTATION_RANK ? names[rank] : "Unknown";
+    }
+
+    std::optional<ReputationRank> ParseReputationRank(std::string_view text)
+    {
+        std::string rank = ToLower(Trim(text));
+        static std::array<std::string_view, MAX_REPUTATION_RANK> const names =
+        {
+            "hated", "hostile", "unfriendly", "neutral", "friendly", "honored", "revered", "exalted"
+        };
+        for (uint8 index = 0; index < names.size(); ++index)
+            if (rank == names[index])
+                return static_cast<ReputationRank>(index);
+        return std::nullopt;
+    }
+
+    bool ExtractStandingOption(std::string& factionText, std::optional<ReputationRank>& targetRank)
+    {
+        std::string lower = ToLower(factionText);
+        size_t option = lower.rfind(" --standing ");
+        if (option == std::string::npos)
+            return true;
+
+        targetRank = ParseReputationRank(std::string_view(factionText).substr(option + 12));
+        if (!targetRank)
+            return false;
+
+        factionText = Trim(std::string_view(factionText).substr(0, option));
+        return !factionText.empty();
+    }
+
     std::string SourceDescription(uint8 sourceMask)
     {
         std::vector<std::string> names;
@@ -371,6 +422,8 @@ namespace
             names.emplace_back("creature loot");
         if (sourceMask & SOURCE_CREATURE_SKIN)
             names.emplace_back("skinning");
+        if (sourceMask & SOURCE_REPUTATION)
+            names.emplace_back("reputation kills");
 
         std::ostringstream output;
         for (size_t index = 0; index < names.size(); ++index)
@@ -805,6 +858,159 @@ namespace
             return true;
         }
 
+        bool StartReputation(ChatHandler* handler, Player* bot, std::string factionText)
+        {
+            if (!_config.enabled)
+            {
+                handler->SendErrorMessage("Autofarm is disabled in the worldserver configuration.");
+                return false;
+            }
+            if (!bot)
+            {
+                handler->SendErrorMessage("Select an online playerbot, specify its character name, or use your "
+                    "current character.");
+                return false;
+            }
+
+            PlayerbotAI* botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+            bool needsSelfbot = !botAI && bot == handler->GetPlayer();
+            if (!needsSelfbot)
+            {
+                botAI = ValidateBot(handler, bot);
+                if (!botAI)
+                    return false;
+            }
+            if (_sessions.contains(bot->GetGUID()))
+            {
+                handler->SendErrorMessage("That playerbot already has an autofarm session. Stop it first.");
+                return false;
+            }
+            if (!ValidateStartState(handler, bot))
+                return false;
+
+            std::optional<ReputationRank> requestedRank;
+            if (!ExtractStandingOption(factionText, requestedRank))
+            {
+                handler->SendErrorMessage("Invalid standing. Use hated, hostile, unfriendly, neutral, friendly, "
+                    "honored, revered, or exalted.");
+                return false;
+            }
+
+            std::vector<FactionEntry const*> matches;
+            FactionEntry const* faction = ResolveFaction(factionText, matches);
+            if (!faction)
+            {
+                if (matches.empty())
+                    handler->SendErrorMessage("No reputation faction matched '{}'.", factionText);
+                else
+                {
+                    handler->SendErrorMessage("'{}' is ambiguous. Matching factions include:", factionText);
+                    SendFactionMatches(handler, matches, 10);
+                }
+                return false;
+            }
+
+            ReputationRank targetRank = REP_HATED;
+            std::vector<SourceSpawn> sources = FindReputationSources(bot, faction->ID, requestedRank, targetRank);
+            int32 targetStanding = ReputationMgr::ReputationRankToStanding(targetRank);
+            int32 currentStanding = bot->GetReputationMgr().GetReputation(faction);
+            if (sources.empty())
+            {
+                handler->PSendSysMessage(
+                    "No usable Vanilla outdoor mobs can raise {} to {} for this level and faction. Try a lower "
+                    "--standing target, or verify Autofarm.AllowedMaps includes 0 and 1.",
+                    faction->name[0], ReputationRankName(targetRank));
+                return false;
+            }
+            if (currentStanding >= targetStanding)
+            {
+                handler->PSendSysMessage("{} has already reached {} with {}.", bot->GetName(),
+                    ReputationRankName(targetRank), faction->name[0]);
+                return false;
+            }
+
+            std::vector<SourceSpawn> selectedSources = SelectZone(bot, sources);
+            if (selectedSources.empty())
+            {
+                handler->PSendSysMessage("No productive Vanilla zone route could be selected for {}.",
+                    faction->name[0]);
+                return false;
+            }
+            auto firstActiveSource = std::find_if(selectedSources.begin(), selectedSources.end(),
+                [](SourceSpawn const& source) { return IsSourceSpawnActive(source); });
+            if (firstActiveSource == selectedSources.end())
+            {
+                handler->PSendSysMessage("No {} reputation target is currently active in the selected zone.",
+                    faction->name[0]);
+                return false;
+            }
+            std::rotate(selectedSources.begin(), firstActiveSource, selectedSources.end());
+
+            bool selfbotEnabled = false;
+            if (needsSelfbot)
+            {
+                botAI = EnableSelfbotForStart(handler, bot);
+                if (!botAI)
+                    return false;
+                selfbotEnabled = true;
+            }
+
+            auto session = std::make_unique<FarmSession>();
+            session->botGuid = bot->GetGUID();
+            session->ownerGuid = handler->GetPlayer()->GetGUID();
+            session->mode = FarmMode::Reputation;
+            session->factionId = faction->ID;
+            session->itemName = faction->name[0];
+            session->routeZoneId = GetSourceZoneId(selectedSources.front());
+            session->startingReputation = currentStanding;
+            session->targetReputation = targetStanding;
+            session->targetReputationRank = targetRank;
+            session->startedAtMs = getMSTime();
+            session->returnLocation = WorldLocation(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                bot->GetPositionZ(), bot->GetOrientation());
+            session->lastSafeLocation = session->returnLocation;
+            session->hasLastSafeLocation = true;
+            session->selfbotEnabledByAutofarm = selfbotEnabled;
+            BuildRoute(*session, std::move(selectedSources));
+
+            CaptureAndApplyStrategies(botAI, *session);
+            ApplyPlayerOverrides(botAI, *session);
+
+            RoutePoint const& firstPoint = session->route.front();
+            if (_config.teleportToRoute)
+            {
+                session->waitingForInitialTeleport = true;
+                if (!bot->TeleportTo(firstPoint.source.mapId, firstPoint.source.x, firstPoint.source.y,
+                    firstPoint.source.z, firstPoint.source.orientation))
+                {
+                    RestoreStrategies(botAI, *session);
+                    RestorePlayerOverrides(bot, *session);
+                    if (selfbotEnabled)
+                        DisableSelfbot(bot, botAI);
+                    handler->SendErrorMessage("The playerbot could not teleport to the reputation route.");
+                    return false;
+                }
+            }
+            else
+                SetTravelTarget(botAI, *session);
+
+            uint32 routeSize = session->route.size();
+            uint32 routeMap = firstPoint.source.mapId;
+            AreaTableEntry const* routeZone = sAreaTableStore.LookupEntry(session->routeZoneId);
+            std::string routeZoneName = routeZone ? PlayerbotAI::GetLocalizedAreaName(routeZone) : "Unknown zone";
+            _sessions.emplace(bot->GetGUID(), std::move(session));
+
+            handler->PSendSysMessage(
+                "Reputation farming started for {}: {} ({}) to {}, {} mob spawns in {} on map {}.",
+                bot->GetName(), faction->name[0], faction->ID, ReputationRankName(targetRank), routeSize,
+                routeZoneName, routeMap);
+            handler->SendSysMessage("This first reputation release uses direct mob-kill rewards on outdoor "
+                "Eastern Kingdoms and Kalimdor maps. It does not run dungeons, turn in items, or complete quests.");
+            if (selfbotEnabled)
+                handler->SendSysMessage("Selfbot was enabled automatically and will be disabled when autofarm stops.");
+            return true;
+        }
+
         bool Stop(ChatHandler* handler, Player* bot)
         {
             PlayerbotAI* botAI = ValidateBot(handler, bot);
@@ -858,11 +1064,76 @@ namespace
             }
 
             FarmSession const& session = *sessionIterator->second;
-            uint32 currentCount = bot->GetItemCount(session.itemId);
-            uint32 gained = currentCount > session.startingCount ? currentCount - session.startingCount : 0;
             uint32 elapsedSeconds = getMSTimeDiff(session.startedAtMs, getMSTime()) / IN_MILLISECONDS;
             AreaTableEntry const* routeZone = sAreaTableStore.LookupEntry(session.routeZoneId);
             std::string routeZoneName = routeZone ? PlayerbotAI::GetLocalizedAreaName(routeZone) : "Unknown zone";
+            if (session.mode == FarmMode::Reputation)
+            {
+                FactionEntry const* faction = sFactionStore.LookupEntry(session.factionId);
+                int32 currentReputation = faction ? bot->GetReputationMgr().GetReputation(faction) :
+                    session.startingReputation;
+                int32 gained = std::max(0, currentReputation - session.startingReputation);
+                if (uiStatus)
+                {
+                    RoutePoint const& point = session.route[session.routeIndex];
+                    float distance = bot->GetMapId() == point.source.mapId
+                        ? bot->GetExactDist(point.source.x, point.source.y, point.source.z) : -1.0f;
+                    uint32 ratePerHour = elapsedSeconds
+                        ? static_cast<uint32>(static_cast<uint64>(gained) * HOUR / elapsedSeconds) : 0;
+                    std::string state = bot->IsInCombat() ? "Combat" :
+                        bot->isMoving() ? "Traveling to reputation target" : "Waiting for target";
+                    if (session.recoveringFromDeath || !bot->IsAlive() ||
+                        bot->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+                    {
+                        state = "Corpse recovery";
+                    }
+
+                    std::string sourceName = "Reputation target";
+                    if (CreatureTemplate const* source = sObjectMgr->GetCreatureTemplate(point.source.entry))
+                        sourceName = source->Name;
+                    AreaTableEntry const* area = GetAreaEntryByAreaID(bot->GetAreaId());
+                    std::string areaName = area ? PlayerbotAI::GetLocalizedAreaName(area) : "Unknown area";
+                    uint32 stalledSeconds = session.lastRouteProgressAtMs
+                        ? getMSTimeDiff(session.lastRouteProgressAtMs, getMSTime()) / IN_MILLISECONDS : 0;
+                    auto cleanField = [](std::string value)
+                    {
+                        std::replace(value.begin(), value.end(), '|', '/');
+                        std::replace(value.begin(), value.end(), '=', '-');
+                        std::replace(value.begin(), value.end(), '\n', ' ');
+                        std::replace(value.begin(), value.end(), '\r', ' ');
+                        return value;
+                    };
+                    handler->PSendSysMessage(
+                        "AFSTATUS|mode=reputation|bot={}|state={}|selfbot={}|level={}|health={:.0f}|farmzone={}|"
+                        "area={}|map={}|x={:.0f}|y={:.0f}|item={}|itemid=0|faction={}|factionid={}|standing={}|"
+                        "gained={}|goal={}|inventory={}|free={}|route={}|routes={}|loops={}|source={}|"
+                        "distance={:.1f}|moving={}|recoveries={}|reroutes={}|stalled={}|elapsed={}|rate={}",
+                        cleanField(bot->GetName()), cleanField(state),
+                        session.selfbotEnabledByAutofarm ? "automatic" : "existing", bot->GetLevel(),
+                        bot->GetHealthPct(), cleanField(routeZoneName), cleanField(areaName), bot->GetMapId(),
+                        bot->GetPositionX(), bot->GetPositionY(), cleanField(session.itemName),
+                        cleanField(session.itemName), session.factionId,
+                        ReputationRankName(bot->GetReputationRank(session.factionId)), gained,
+                        session.targetReputation - session.startingReputation, currentReputation,
+                        bot->GetFreeInventorySpace(), session.routeIndex + 1, session.route.size(),
+                        session.completedLoops, cleanField(sourceName), distance, bot->isMoving() ? 1 : 0,
+                        session.stuckRecoveryAttempts, session.pathReroutes, stalledSeconds, elapsedSeconds,
+                        ratePerHour);
+                    return true;
+                }
+
+                handler->PSendSysMessage(
+                    "{} is farming {} reputation in {}: {} gained, current standing {}, target {}, route {}/{}, "
+                    "loops {}, elapsed {}m {}s.",
+                    bot->GetName(), session.itemName, routeZoneName, gained,
+                    ReputationRankName(bot->GetReputationRank(session.factionId)),
+                    ReputationRankName(session.targetReputationRank), session.routeIndex + 1, session.route.size(),
+                    session.completedLoops, elapsedSeconds / 60, elapsedSeconds % 60);
+                return true;
+            }
+
+            uint32 currentCount = bot->GetItemCount(session.itemId);
+            uint32 gained = currentCount > session.startingCount ? currentCount - session.startingCount : 0;
             if (uiStatus)
             {
                 RoutePoint const& point = session.route[session.routeIndex];
@@ -972,6 +1243,42 @@ namespace
 
             handler->PSendSysMessage("Item matches for '{}':", query);
             SendItemMatches(handler, matches, 20);
+        }
+
+        void SearchReputation(ChatHandler* handler, Player* bot, std::string_view query)
+        {
+            std::string needle = ToLower(Trim(query));
+            if (needle.empty())
+            {
+                handler->SendErrorMessage("Usage: .autofarm repsearch <partial faction name>");
+                return;
+            }
+
+            std::vector<FactionEntry const*> matches;
+            for (uint32 index = 1; index < sFactionStore.GetNumRows(); ++index)
+            {
+                FactionEntry const* faction = sFactionStore.LookupEntry(index);
+                if (!faction || !faction->CanHaveReputation() || !faction->name[0] ||
+                    ToLower(faction->name[0]).find(needle) == std::string::npos)
+                {
+                    continue;
+                }
+
+                ReputationRank targetRank = REP_HATED;
+                if (!FindReputationSources(bot, faction->ID, std::nullopt, targetRank).empty())
+                    matches.push_back(faction);
+                if (matches.size() == 20)
+                    break;
+            }
+
+            if (matches.empty())
+            {
+                handler->SendErrorMessage("No Vanilla outdoor mob-grind factions contain '{}'.", query);
+                return;
+            }
+
+            handler->PSendSysMessage("Vanilla mob-grind reputation matches for '{}':", query);
+            SendFactionMatches(handler, matches, 20);
         }
 
         Player* ResolveBotForCommand(ChatHandler* handler, std::string_view requestedName, bool allowOwnedFallback)
@@ -1157,6 +1464,113 @@ namespace
             size_t count = std::min(limit, matches.size());
             for (size_t index = 0; index < count; ++index)
                 handler->PSendSysMessage("  {} - {}", matches[index]->ItemId, matches[index]->Name1);
+        }
+
+        static FactionEntry const* ResolveFaction(std::string_view query,
+            std::vector<FactionEntry const*>& matches)
+        {
+            std::string trimmed = Trim(query);
+            if (std::optional<uint32> factionId = ParseUInt(trimmed))
+            {
+                FactionEntry const* faction = sFactionStore.LookupEntry(*factionId);
+                return faction && faction->CanHaveReputation() ? faction : nullptr;
+            }
+
+            std::string needle = ToLower(trimmed);
+            FactionEntry const* exact = nullptr;
+            for (uint32 index = 1; index < sFactionStore.GetNumRows(); ++index)
+            {
+                FactionEntry const* faction = sFactionStore.LookupEntry(index);
+                if (!faction || !faction->CanHaveReputation() || !faction->name[0])
+                    continue;
+
+                std::string name = ToLower(faction->name[0]);
+                if (name == needle)
+                    exact = faction;
+                if (name.find(needle) != std::string::npos && matches.size() < 20)
+                    matches.push_back(faction);
+            }
+
+            if (exact)
+                return exact;
+            if (matches.size() == 1)
+                return matches.front();
+            return nullptr;
+        }
+
+        static void SendFactionMatches(ChatHandler* handler, std::vector<FactionEntry const*> const& matches,
+            size_t limit)
+        {
+            size_t count = std::min(limit, matches.size());
+            for (size_t index = 0; index < count; ++index)
+                handler->PSendSysMessage("  {} - {}", matches[index]->ID, matches[index]->name[0]);
+        }
+
+        static std::optional<ReputationRank> GetReputationCap(Player const* bot,
+            ReputationOnKillEntry const* reward, uint32 factionId)
+        {
+            if (!reward)
+                return std::nullopt;
+
+            TeamId team = bot->GetTeamId(true);
+            std::optional<ReputationRank> cap;
+            if (reward->RepFaction1 == factionId && reward->RepValue1 > 0.0f &&
+                (!reward->TeamDependent || team == TEAM_ALLIANCE) &&
+                reward->ReputationMaxCap1 < MAX_REPUTATION_RANK)
+            {
+                cap = static_cast<ReputationRank>(reward->ReputationMaxCap1);
+            }
+            if (reward->RepFaction2 == factionId && reward->RepValue2 > 0.0f &&
+                (!reward->TeamDependent || team == TEAM_HORDE) &&
+                reward->ReputationMaxCap2 < MAX_REPUTATION_RANK)
+            {
+                ReputationRank secondCap = static_cast<ReputationRank>(reward->ReputationMaxCap2);
+                if (!cap || secondCap > *cap)
+                    cap = secondCap;
+            }
+            return cap;
+        }
+
+        std::vector<SourceSpawn> FindReputationSources(Player* bot, uint32 factionId,
+            std::optional<ReputationRank> requestedRank, ReputationRank& targetRank) const
+        {
+            std::unordered_map<uint32, ReputationRank> creatureEntries;
+            ReputationRank highestCap = REP_HATED;
+            if (CreatureTemplateContainer const* creatures = sObjectMgr->GetCreatureTemplates())
+            {
+                for (auto const& [entry, creatureTemplate] : *creatures)
+                {
+                    if (creatureTemplate.rank == CREATURE_ELITE_WORLDBOSS)
+                        continue;
+                    if (creatureTemplate.maxlevel > bot->GetLevel() + _config.maxCreatureLevelsAboveBot)
+                        continue;
+
+                    std::optional<ReputationRank> cap = GetReputationCap(bot,
+                        sObjectMgr->GetReputationOnKilEntry(entry), factionId);
+                    if (!cap)
+                        continue;
+
+                    creatureEntries.emplace(entry, *cap);
+                    highestCap = std::max(highestCap, *cap);
+                }
+            }
+
+            targetRank = requestedRank.value_or(highestCap);
+            std::vector<SourceSpawn> sources;
+            for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+            {
+                auto entry = creatureEntries.find(data.id);
+                if (entry == creatureEntries.end() || entry->second < targetRank)
+                    continue;
+                if ((data.mapid != 0 && data.mapid != 1) || !MapAllowed(_config, data.mapid))
+                    continue;
+                if (!(data.phaseMask & PHASEMASK_NORMAL))
+                    continue;
+
+                sources.push_back({spawnId, data.id, data.mapid, data.posX, data.posY, data.posZ,
+                    data.orientation, SOURCE_REPUTATION});
+            }
+            return sources;
         }
 
         std::vector<SourceSpawn> FindSources(Player* bot, uint32 itemId) const
@@ -1726,10 +2140,13 @@ namespace
                 SetStrategy(botAI, name, BOT_STATE_NON_COMBAT, enabled);
             }
 
-            auto& alwaysLoot = botAI->GetAiObjectContext()
-                ->GetValue<std::set<uint32>&>("always loot list")->Get();
-            session.itemWasAlwaysLooted = alwaysLoot.contains(session.itemId);
-            alwaysLoot.insert(session.itemId);
+            if (session.mode == FarmMode::Item)
+            {
+                auto& alwaysLoot = botAI->GetAiObjectContext()
+                    ->GetValue<std::set<uint32>&>("always loot list")->Get();
+                session.itemWasAlwaysLooted = alwaysLoot.contains(session.itemId);
+                alwaysLoot.insert(session.itemId);
+            }
         }
 
         void ApplyPlayerOverrides(PlayerbotAI* botAI, FarmSession& session) const
@@ -1883,7 +2300,7 @@ namespace
             for (StrategyState const& strategy : session.strategies)
                 SetStrategy(botAI, strategy.name, strategy.state, strategy.wasEnabled);
 
-            if (!session.itemWasAlwaysLooted)
+            if (session.mode == FarmMode::Item && !session.itemWasAlwaysLooted)
             {
                 auto& alwaysLoot = botAI->GetAiObjectContext()
                     ->GetValue<std::set<uint32>&>("always loot list")->Get();
@@ -2216,14 +2633,30 @@ namespace
                 return std::nullopt;
             }
 
-            uint32 currentCount = bot->GetItemCount(session.itemId);
-            uint32 gained = currentCount > session.startingCount ? currentCount - session.startingCount : 0;
-            if (session.goalAmount && gained >= session.goalAmount)
-                return Acore::StringFormat("goal reached: collected {} {}", gained, session.itemName);
+            if (session.mode == FarmMode::Reputation)
+            {
+                FactionEntry const* faction = sFactionStore.LookupEntry(session.factionId);
+                if (!faction)
+                    return "reputation faction is no longer available";
 
-            ItemPosCountVec destinations;
-            if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, destinations, session.itemId, 1) != EQUIP_ERR_OK)
-                return Acore::StringFormat("inventory cannot store another {}", session.itemName);
+                int32 currentReputation = bot->GetReputationMgr().GetReputation(faction);
+                if (currentReputation >= session.targetReputation)
+                {
+                    return Acore::StringFormat("goal reached: {} with {}",
+                        ReputationRankName(session.targetReputationRank), session.itemName);
+                }
+            }
+            else
+            {
+                uint32 currentCount = bot->GetItemCount(session.itemId);
+                uint32 gained = currentCount > session.startingCount ? currentCount - session.startingCount : 0;
+                if (session.goalAmount && gained >= session.goalAmount)
+                    return Acore::StringFormat("goal reached: collected {} {}", gained, session.itemName);
+
+                ItemPosCountVec destinations;
+                if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, destinations, session.itemId, 1) != EQUIP_ERR_OK)
+                    return Acore::StringFormat("inventory cannot store another {}", session.itemName);
+            }
 
             if (bot->IsBeingTeleported())
                 return std::nullopt;
@@ -2388,6 +2821,12 @@ namespace
                 return;
             }
 
+            if (session.mode == FarmMode::Reputation)
+            {
+                AdvanceRoute(botAI, session);
+                return;
+            }
+
             LootObject loot(bot, creature->GetGUID());
             if (loot.IsEmpty() || !loot.IsLootPossible(bot))
             {
@@ -2508,7 +2947,10 @@ namespace
                 {"stopall", HandleStopAll, SEC_PLAYER, Console::No},
                 {"status", HandleStatus, SEC_PLAYER, Console::No},
                 {"statusui", HandleStatusUi, SEC_PLAYER, Console::No},
-                {"search", HandleSearch, SEC_PLAYER, Console::No}
+                {"search", HandleSearch, SEC_PLAYER, Console::No},
+                {"rep", HandleReputation, SEC_PLAYER, Console::No},
+                {"repbot", HandleReputationBot, SEC_PLAYER, Console::No},
+                {"repsearch", HandleReputationSearch, SEC_PLAYER, Console::No}
             };
             static ChatCommandTable commands =
             {
@@ -2541,6 +2983,40 @@ namespace
                 return false;
             }
             return AutofarmMgr::Instance().Start(handler, bot, itemText);
+        }
+
+        static bool HandleReputation(ChatHandler* handler, Tail factionText)
+        {
+            std::string text = Trim(factionText);
+            if (text.empty())
+            {
+                handler->SendErrorMessage(
+                    "Usage: .autofarm rep <faction> [--standing friendly|honored|revered|exalted]");
+                return false;
+            }
+            return AutofarmMgr::Instance().StartReputation(handler, handler->GetPlayer(), text);
+        }
+
+        static bool HandleReputationBot(ChatHandler* handler, Tail arguments)
+        {
+            std::string text = Trim(arguments);
+            size_t separator = text.find(' ');
+            if (separator == std::string::npos)
+            {
+                handler->SendErrorMessage(
+                    "Usage: .autofarm repbot <character> <faction> [--standing friendly|honored|revered|exalted]");
+                return false;
+            }
+
+            std::string botName = text.substr(0, separator);
+            std::string factionText = Trim(std::string_view(text).substr(separator + 1));
+            Player* bot = AutofarmMgr::Instance().ResolveBotForCommand(handler, botName, false);
+            if (!bot)
+            {
+                handler->SendErrorMessage("Online playerbot '{}' was not found.", botName);
+                return false;
+            }
+            return AutofarmMgr::Instance().StartReputation(handler, bot, factionText);
         }
 
         static bool HandleStop(ChatHandler* handler, Tail botName)
@@ -2584,6 +3060,12 @@ namespace
         static bool HandleSearch(ChatHandler* handler, Tail itemText)
         {
             AutofarmMgr::Instance().Search(handler, itemText);
+            return true;
+        }
+
+        static bool HandleReputationSearch(ChatHandler* handler, Tail factionText)
+        {
+            AutofarmMgr::Instance().SearchReputation(handler, handler->GetPlayer(), factionText);
             return true;
         }
     };

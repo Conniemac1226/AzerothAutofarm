@@ -1,4 +1,4 @@
-AZEROTH AUTOFARM 1.1.1
+AZEROTH AUTOFARM 1.2.0
 ======================
 
 A standalone World of Warcraft 3.3.5a control panel for the AzerothCore
@@ -27,16 +27,18 @@ USAGE
 - Target an online playerbot and click Use Target, or type its exact name.
 - Select a material preset, or enter an item name, ID, or shift-clicked link.
 - Set a quantity goal. Zero means unlimited.
-- Click Start Farming.
+- Click Start Items for a material route.
+- To farm reputation, enter a faction name or ID in the same field and click
+  Start Rep. Append --standing revered, honored, or exalted to set the goal.
 - Use Status, Stop, or Stop All to manage sessions.
 - Right-click material rows to add them to Favorites.
 - Click Activity to see commands and server replies.
 - Keep Activity open to monitor the configured altbot. The dashboard refreshes
   one lightweight server snapshot every 15 seconds and stops polling when the
   window is closed.
-- The Activity dashboard shows the bot's state, health, bags, location,
-  material progress, current source, route position, distance, elapsed time,
-  gathering rate, and movement-recovery information.
+- The Activity dashboard shows the bot's state, health, bags or reputation,
+  location, progress, current source, route position, distance, elapsed time,
+  farming rate, and movement-recovery information.
 
 SLASH COMMANDS
 --------------
@@ -57,6 +59,8 @@ NOTES
   the client. Automatic refresh can be disabled from the Activity window.
 - The main, Activity, and Help windows automatically scale to fit the current
   display resolution and UI scale while preserving their internal layout.
+- The minimap button uses the standard 3.3.5 tracking-button layout and remains
+  aligned when collected into ElvUI or another minimap-button bar.
 - The playerbot must already be online through mod-playerbots.
 - Gathering professions, skill, and required tools are still required.
 - Fishing presets only work when an outdoor fishing-school source exists.
