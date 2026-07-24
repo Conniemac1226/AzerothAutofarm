@@ -23,10 +23,12 @@
 #include "MovementActions.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
+#include "PathGenerator.h"
 #include "Pet.h"
 #include "Player.h"
 #include "PlayerScript.h"
 #include "Playerbots.h"
+#include "PoolMgr.h"
 #include "ScriptMgr.h"
 #include "StringFormat.h"
 #include "Timer.h"
@@ -65,6 +67,9 @@ namespace
     constexpr uint32 AUTOFARM_NODE_RETRY_MS = 3 * IN_MILLISECONDS;
     constexpr uint8 AUTOFARM_RETRIES_BEFORE_SKIP = 4;
     constexpr float AUTOFARM_GROUND_APPROACH_RADIUS = 6.0f;
+    constexpr size_t AUTOFARM_NEAREST_PATH_CANDIDATES = 16;
+    constexpr size_t AUTOFARM_DIVERSE_PATH_CANDIDATES = 48;
+    constexpr float AUTOFARM_GROUND_PATH_STEP_DISTANCE = 180.0f;
 
     enum class FlightStage : uint8
     {
@@ -109,6 +114,18 @@ namespace
         uint8 sourceMask = 0;
     };
 
+    bool IsSourceSpawnActive(SourceSpawn const& source)
+    {
+        if (source.sourceMask & SOURCE_GAMEOBJECT)
+        {
+            return !sPoolMgr->IsPartOfAPool<GameObject>(source.spawnId) ||
+                sPoolMgr->IsSpawnedObject<GameObject>(source.spawnId);
+        }
+
+        return !sPoolMgr->IsPartOfAPool<Creature>(source.spawnId) ||
+            sPoolMgr->IsSpawnedObject<Creature>(source.spawnId);
+    }
+
     class AutofarmDestination final : public TravelDestination
     {
     public:
@@ -147,6 +164,34 @@ namespace
 
         bool MoveNearPoint(SourceSpawn const& source)
         {
+            float destinationZ = source.z;
+            bot->UpdateAllowedPositionZ(source.x, source.y, destinationZ);
+            PathGenerator path(bot);
+            path.SetSlopeCheck(true);
+            if (path.CalculatePath(source.x, source.y, destinationZ, false))
+            {
+                PathType type = path.GetPathType();
+                if (!path.GetPath().empty() && (type & PATHFIND_SHORT) &&
+                    !(type & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_NOT_USING_PATH)))
+                {
+                    G3D::Vector3 pathEnd = path.GetPath().front();
+                    for (G3D::Vector3 const& point : path.GetPath())
+                    {
+                        if (bot->GetExactDist2d(point.x, point.y) > AUTOFARM_GROUND_PATH_STEP_DISTANCE)
+                            break;
+                        pathEnd = point;
+                    }
+                    float stepDistance = bot->GetExactDist2d(pathEnd.x, pathEnd.y);
+                    float remainingDistance = std::hypot(pathEnd.x - source.x, pathEnd.y - source.y);
+                    if (stepDistance >= 20.0f &&
+                        remainingDistance + 10.0f < bot->GetExactDist2d(source.x, source.y))
+                    {
+                        return MoveTo(source.mapId, pathEnd.x, pathEnd.y, pathEnd.z, false, false, true, false,
+                            MovementPriority::MOVEMENT_FORCED, true);
+                    }
+                }
+            }
+
             float startAngle = std::atan2(bot->GetPositionY() - source.y, bot->GetPositionX() - source.x);
             for (uint8 index = 0; index < 8; ++index)
             {
@@ -207,6 +252,7 @@ namespace
         bool recoveringFromDeath = false;
         bool combatStrategiesSuppressed = false;
         bool passiveNodeGathering = false;
+        bool selfbotEnabledByAutofarm = false;
         bool nodeApproachActive = false;
         bool npcImmunityApplied = false;
         bool pcImmunityApplied = false;
@@ -217,12 +263,14 @@ namespace
         float flightCruiseZ = std::numeric_limits<float>::lowest();
         uint32 flightCombatStartedAtMs = 0;
         uint32 lastKeepAliveAtMs = 0;
+        uint32 pathReroutes = 0;
         WorldLocation returnLocation;
         WorldLocation lastSafeLocation;
         bool hasLastSafeLocation = false;
         std::vector<StrategyState> strategies;
         std::vector<std::string> combatStrategies;
         std::vector<RoutePoint> route;
+        std::unordered_set<size_t> temporarilyUnreachableRoutePoints;
     };
 
     struct ZoneKey
@@ -601,9 +649,21 @@ namespace
                 return false;
             }
 
-            PlayerbotAI* botAI = ValidateBot(handler, bot);
-            if (!botAI)
+            if (!bot)
+            {
+                handler->SendErrorMessage("Select an online playerbot, specify its character name, or leave the "
+                    "selection blank to farm with your current character.");
                 return false;
+            }
+
+            PlayerbotAI* botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+            bool needsSelfbot = !botAI && bot == handler->GetPlayer();
+            if (!needsSelfbot)
+            {
+                botAI = ValidateBot(handler, bot);
+                if (!botAI)
+                    return false;
+            }
 
             if (_sessions.contains(bot->GetGUID()))
             {
@@ -656,6 +716,25 @@ namespace
                 return false;
             }
 
+            auto firstActiveSource = std::find_if(selectedSources.begin(), selectedSources.end(),
+                [](SourceSpawn const& source) { return IsSourceSpawnActive(source); });
+            if (firstActiveSource == selectedSources.end())
+            {
+                handler->SendErrorMessage("No source spawn for [{}] is currently active in the selected zone.",
+                    itemTemplate->Name1);
+                return false;
+            }
+            std::rotate(selectedSources.begin(), firstActiveSource, selectedSources.end());
+
+            bool selfbotEnabled = false;
+            if (needsSelfbot)
+            {
+                botAI = EnableSelfbotForStart(handler, bot);
+                if (!botAI)
+                    return false;
+                selfbotEnabled = true;
+            }
+
             auto session = std::make_unique<FarmSession>();
             session->botGuid = bot->GetGUID();
             session->ownerGuid = handler->GetPlayer()->GetGUID();
@@ -671,6 +750,7 @@ namespace
             session->hasLastSafeLocation = true;
             session->passiveNodeGathering = _config.passiveNodeGathering &&
                 IsMiningOrHerbalismRoute(selectedSources);
+            session->selfbotEnabledByAutofarm = selfbotEnabled;
             BuildRoute(*session, std::move(selectedSources));
 
             CaptureAndApplyStrategies(botAI, *session);
@@ -685,6 +765,8 @@ namespace
                 {
                     RestoreStrategies(botAI, *session);
                     RestorePlayerOverrides(bot, *session);
+                    if (selfbotEnabled)
+                        DisableSelfbot(bot, botAI);
                     handler->SendErrorMessage("The playerbot could not teleport to the selected farming route.");
                     return false;
                 }
@@ -717,6 +799,9 @@ namespace
                     "between fights.");
             if (passiveNodeGathering)
                 handler->SendSysMessage("This mining/herbalism node route ignores NPC and player-controlled combat.");
+            if (selfbotEnabled)
+                handler->SendSysMessage("Selfbot was enabled automatically for this character and will be disabled "
+                    "when autofarm stops.");
             return true;
         }
 
@@ -733,9 +818,11 @@ namespace
             }
 
             std::string botName = bot->GetName();
+            bool selfbotWillDisable = _sessions.at(bot->GetGUID())->selfbotEnabledByAutofarm;
             StopSession(bot->GetGUID(), "stopped by owner", _config.returnOnStop, false);
-            handler->PSendSysMessage("Autofarm stopped for {}{}.", botName,
-                _config.returnOnStop ? " and the bot was returned" : "");
+            handler->PSendSysMessage("Autofarm stopped for {}{}{}.", botName,
+                _config.returnOnStop ? " and the bot was returned" : "",
+                selfbotWillDisable ? "; selfbot disabled" : "");
             return true;
         }
 
@@ -832,16 +919,19 @@ namespace
                 };
 
                 handler->PSendSysMessage(
-                    "AFSTATUS|bot={}|state={}|level={}|health={:.0f}|area={}|farmzone={}|map={}|x={:.0f}|y={:.0f}|"
+                    "AFSTATUS|bot={}|state={}|selfbot={}|level={}|health={:.0f}|area={}|farmzone={}|map={}|"
+                    "x={:.0f}|y={:.0f}|"
                     "item={}|itemid={}|gained={}|goal={}|inventory={}|free={}|route={}|routes={}|loops={}|"
-                    "source={}|distance={:.1f}|moving={}|recoveries={}|stalled={}|elapsed={}|rate={}",
-                    cleanField(bot->GetName()), cleanField(state), bot->GetLevel(), bot->GetHealthPct(),
+                    "source={}|distance={:.1f}|moving={}|recoveries={}|reroutes={}|stalled={}|elapsed={}|rate={}",
+                    cleanField(bot->GetName()), cleanField(state),
+                    session.selfbotEnabledByAutofarm ? "automatic" : "existing", bot->GetLevel(),
+                    bot->GetHealthPct(),
                     cleanField(areaName), cleanField(routeZoneName), bot->GetMapId(), bot->GetPositionX(),
                     bot->GetPositionY(),
                     cleanField(session.itemName), session.itemId, gained, session.goalAmount, currentCount,
                     bot->GetFreeInventorySpace(), session.routeIndex + 1, session.route.size(),
                     session.completedLoops, cleanField(sourceName), distance, bot->isMoving() ? 1 : 0,
-                    session.stuckRecoveryAttempts, stalledSeconds, elapsedSeconds, ratePerHour);
+                    session.stuckRecoveryAttempts, session.pathReroutes, stalledSeconds, elapsedSeconds, ratePerHour);
                 return true;
             }
 
@@ -969,6 +1059,39 @@ namespace
         }
 
     private:
+        static PlayerbotAI* EnableSelfbotForStart(ChatHandler* handler, Player* player)
+        {
+            PlayerbotMgr* playerbotMgr = GET_PLAYERBOT_MGR(player);
+            if (!playerbotMgr)
+            {
+                handler->SendErrorMessage("Autofarm could not enable selfbot because the playerbot manager is not "
+                    "available for this character.");
+                return nullptr;
+            }
+
+            char command[] = "self";
+            std::vector<std::string> messages = playerbotMgr->HandlePlayerbotCommand(command, player);
+            PlayerbotAI* botAI = sPlayerbotsMgr.GetPlayerbotAI(player);
+            if (!botAI)
+            {
+                std::string reason = messages.empty() ? "selfbot was rejected by mod-playerbots" : messages.back();
+                handler->SendErrorMessage("Autofarm could not enable selfbot: {}.", reason);
+                return nullptr;
+            }
+
+            LOG_INFO("module.autofarm", "Autofarm enabled selfbot for {}", player->GetName());
+            return botAI;
+        }
+
+        static void DisableSelfbot(Player* player, PlayerbotAI* botAI)
+        {
+            if (!player || !botAI)
+                return;
+
+            LOG_INFO("module.autofarm", "Autofarm disabled selfbot for {}", player->GetName());
+            delete botAI;
+        }
+
         PlayerbotAI* ValidateBot(ChatHandler* handler, Player* bot) const
         {
             if (!bot)
@@ -1821,16 +1944,111 @@ namespace
             botAI->GetAiObjectContext()->GetValue<LastMovement&>("last movement")->Get().clear();
         }
 
+        static bool HasSafeGroundPath(Player* bot, SourceSpawn const& source)
+        {
+            if (!bot || bot->GetMapId() != source.mapId)
+                return false;
+
+            float destinationZ = source.z;
+            bot->UpdateAllowedPositionZ(source.x, source.y, destinationZ);
+
+            PathGenerator path(bot);
+            path.SetSlopeCheck(true);
+            if (!path.CalculatePath(source.x, source.y, destinationZ, false))
+                return false;
+
+            PathType type = path.GetPathType();
+            if (type & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_NOT_USING_PATH))
+                return false;
+
+            G3D::Vector3 const& actualEnd = path.GetActualEndPosition();
+            float remainingDistance = std::hypot(actualEnd.x - source.x, actualEnd.y - source.y);
+            if (type & PATHFIND_SHORT)
+            {
+                float directDistance = bot->GetExactDist2d(source.x, source.y);
+                return path.getPathLength() >= 20.0f && remainingDistance + 10.0f < directDistance;
+            }
+
+            return remainingDistance <= AUTOFARM_GROUND_APPROACH_RADIUS + INTERACTION_DISTANCE;
+        }
+
+        bool RerouteToReachablePoint(PlayerbotAI* botAI, FarmSession& session, size_t failedRouteIndex)
+        {
+            Player* bot = botAI->GetBot();
+            std::vector<std::pair<double, size_t>> candidates;
+            candidates.reserve(session.route.size());
+            for (size_t index = 0; index < session.route.size(); ++index)
+            {
+                if (index == failedRouteIndex || session.temporarilyUnreachableRoutePoints.contains(index))
+                    continue;
+
+                SourceSpawn const& source = session.route[index].source;
+                if (source.mapId != bot->GetMapId() || !IsSourceSpawnActive(source))
+                    continue;
+
+                candidates.emplace_back(SquaredDistance(bot->GetPositionX(), bot->GetPositionY(), source.x,
+                    source.y), index);
+            }
+            std::sort(candidates.begin(), candidates.end());
+
+            std::unordered_set<size_t> tested;
+            auto tryCandidate = [&](size_t candidatePosition)
+            {
+                if (candidatePosition >= candidates.size())
+                    return false;
+
+                size_t routeIndex = candidates[candidatePosition].second;
+                if (!tested.insert(routeIndex).second || !HasSafeGroundPath(bot, session.route[routeIndex].source))
+                    return false;
+
+                size_t previousRouteIndex = session.routeIndex;
+                session.routeIndex = routeIndex;
+                ++session.pathReroutes;
+                SetTravelTarget(botAI, session);
+                LOG_WARN("module.autofarm",
+                    "Bot {} rerouted from unreachable point {}/{} to reachable point {}/{} in the same zone",
+                    bot->GetName(), previousRouteIndex + 1, session.route.size(), routeIndex + 1,
+                    session.route.size());
+                return true;
+            };
+
+            size_t nearestCount = std::min(AUTOFARM_NEAREST_PATH_CANDIDATES, candidates.size());
+            for (size_t position = 0; position < nearestCount; ++position)
+                if (tryCandidate(position))
+                    return true;
+
+            size_t remainingCount = candidates.size() - nearestCount;
+            size_t diverseCount = std::min(AUTOFARM_DIVERSE_PATH_CANDIDATES, remainingCount);
+            for (size_t sample = 0; sample < diverseCount; ++sample)
+            {
+                size_t position = nearestCount + sample * remainingCount / diverseCount;
+                if (tryCandidate(position))
+                    return true;
+            }
+
+            return false;
+        }
+
         void AdvanceRoute(PlayerbotAI* botAI, FarmSession& session)
         {
             botAI->GetAiObjectContext()->GetValue<ObjectGuid>("pull target")->Reset();
             botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({});
 
-            ++session.routeIndex;
-            if (session.routeIndex >= session.route.size())
+            size_t checked = 0;
+            while (checked < session.route.size())
             {
-                session.routeIndex = 0;
-                ++session.completedLoops;
+                ++session.routeIndex;
+                if (session.routeIndex >= session.route.size())
+                {
+                    session.routeIndex = 0;
+                    ++session.completedLoops;
+                    session.temporarilyUnreachableRoutePoints.clear();
+                }
+
+                ++checked;
+                if (!session.temporarilyUnreachableRoutePoints.contains(session.routeIndex) &&
+                    IsSourceSpawnActive(session.route[session.routeIndex].source))
+                    break;
             }
 
             SetTravelTarget(botAI, session);
@@ -1882,6 +2100,7 @@ namespace
             {
                 session.lastRouteDistance = distance;
                 session.lastRouteProgressAtMs = now;
+                session.pointStartedAtMs = now;
                 session.stuckRecoveryAttempts = 0;
                 return false;
             }
@@ -1900,8 +2119,14 @@ namespace
 
             if (session.stuckRecoveryAttempts >= AUTOFARM_RETRIES_BEFORE_SKIP)
             {
-                LOG_WARN("module.autofarm", "Bot {} could not safely path to route point {}/{}; skipping it",
-                    bot->GetName(), session.routeIndex + 1, session.route.size());
+                size_t failedRouteIndex = session.routeIndex;
+                session.temporarilyUnreachableRoutePoints.insert(failedRouteIndex);
+                if (RerouteToReachablePoint(botAI, session, failedRouteIndex))
+                    return true;
+
+                LOG_WARN("module.autofarm",
+                    "Bot {} could not find a safe path from route point {}/{} to another active source; advancing",
+                    bot->GetName(), failedRouteIndex + 1, session.route.size());
                 AdvanceRoute(botAI, session);
                 return true;
             }
@@ -2014,6 +2239,12 @@ namespace
                 return "bot entered an unsupported instanced map";
 
             RoutePoint& point = session.route[session.routeIndex];
+            if (!IsSourceSpawnActive(point.source))
+            {
+                AdvanceRoute(botAI, session);
+                return std::nullopt;
+            }
+
             if (bot->GetMapId() != point.source.mapId)
             {
                 SetTravelTarget(botAI, session);
@@ -2199,17 +2430,30 @@ namespace
                 returned = bot->TeleportTo(session->returnLocation);
             }
 
+            bool selfbotDisabled = session->selfbotEnabledByAutofarm && botAI;
+            if (selfbotDisabled)
+            {
+                DisableSelfbot(bot, botAI);
+                botAI = nullptr;
+            }
+
+            std::string stopDetails;
+            if (returned)
+                stopDetails += "; returned to start";
+            if (selfbotDisabled)
+                stopDetails += "; selfbot disabled";
+
             if (notifyOwner)
             {
                 if (Player* owner = ObjectAccessor::FindConnectedPlayer(session->ownerGuid))
                 {
                     ChatHandler(owner->GetSession()).PSendSysMessage("Autofarm for {} stopped: {}{}.",
-                        bot ? bot->GetName() : "offline bot", reason, returned ? "; returned to start" : "");
+                        bot ? bot->GetName() : "offline bot", reason, stopDetails);
                 }
             }
 
             LOG_INFO("module.autofarm", "Autofarm session for {} stopped: {}{}",
-                bot ? bot->GetName() : botGuid.ToString(), reason, returned ? " (returned)" : "");
+                bot ? bot->GetName() : botGuid.ToString(), reason, stopDetails);
         }
 
         AutofarmConfig _config;
@@ -2275,14 +2519,7 @@ namespace
 
         static bool HandleStart(ChatHandler* handler, Tail itemText)
         {
-            Player* bot = AutofarmMgr::Instance().ResolveBotForCommand(handler, {}, false);
-            if (!bot)
-            {
-                handler->SendErrorMessage("Select an owned online playerbot first, then use "
-                    ".autofarm start <item> [--count number].");
-                return false;
-            }
-            return AutofarmMgr::Instance().Start(handler, bot, Trim(itemText));
+            return AutofarmMgr::Instance().Start(handler, handler->GetPlayer(), Trim(itemText));
         }
 
         static bool HandleStartBot(ChatHandler* handler, Tail arguments)

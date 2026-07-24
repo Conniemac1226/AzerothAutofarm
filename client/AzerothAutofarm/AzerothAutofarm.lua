@@ -457,7 +457,7 @@ end
 
 function AF:UseTarget()
     if not UnitExists("target") or not UnitIsPlayer("target") then
-        self:SetActivity("Target an online playerbot character first.", "error")
+        self:SetActivity("Target an online player character first.", "error")
         return
     end
 
@@ -709,6 +709,7 @@ function AF:RefreshActivityDashboard()
     local distanceText = distance >= 0 and string.format("%.1f yd", distance) or "Different map"
     local movementText = status.moving == "1" and "Moving" or "Standing"
     local recoveries = tonumber(status.recoveries) or 0
+    local reroutes = tonumber(status.reroutes) or 0
     local stalled = tonumber(status.stalled) or 0
 
     self.activityMaterial:SetText((status.item or "Unknown") .. "  •  item " .. (status.itemid or "?"))
@@ -724,7 +725,10 @@ function AF:RefreshActivityDashboard()
         (status.farmzone or "Unknown farm zone") .. "  •  now " .. (status.area or "Unknown area")
         .. "  •  map " .. (status.map or "?")
     )
-    self.activitySource:SetText((status.source or "Material source") .. "  •  " .. distanceText)
+    self.activitySource:SetText(
+        (status.source or "Material source") .. "  •  " .. distanceText
+        .. "  •  selfbot " .. (status.selfbot or "existing")
+    )
     self.activityVitals:SetText(
         (status.health or "0") .. "% health  •  " .. FormatNumber(status.free) .. " free bag slots"
     )
@@ -732,7 +736,8 @@ function AF:RefreshActivityDashboard()
         FormatDuration(status.elapsed) .. " elapsed  •  " .. FormatNumber(status.rate) .. " items/hour"
     )
     self.activityMovement:SetText(
-        movementText .. "  •  " .. recoveries .. " path recoveries  •  " .. stalled .. "s since progress"
+        movementText .. "  •  " .. recoveries .. " current retries  •  "
+        .. reroutes .. " safe reroutes  •  " .. stalled .. "s since progress"
     )
     self.activityUpdated:SetText("Last server snapshot " .. date("%H:%M:%S") .. "  •  15-second lightweight refresh")
 end
@@ -754,7 +759,8 @@ function AF:HandleStatusTelemetry(message)
     self:RefreshActivityDashboard()
 
     local summaryKey = table.concat({
-        status.bot or "", status.state or "", status.gained or "", status.route or "", status.recoveries or ""
+        status.bot or "", status.state or "", status.gained or "", status.route or "", status.recoveries or "",
+        status.reroutes or ""
     }, "|")
     if summaryKey ~= self.lastStatusLogKey then
         self.lastStatusLogKey = summaryKey
@@ -1003,9 +1009,10 @@ function AF:CreateHelpFrame()
     guide:SetJustifyV("TOP")
     guide:SetSpacing(4)
     guide:SetText(
-        "|cff72d68b1. Choose the playerbot|r\n"
-        .. "Target an online playerbot and click Use Target, or type its exact character name. Leave the name blank "
-        .. "to use the playerbot you currently have selected.\n\n"
+        "|cff72d68b1. Choose the farming character|r\n"
+        .. "Leave the name blank to farm with the character you are playing; autofarm enables selfbot for the "
+        .. "session and disables it when farming stops. To use another online playerbot, target it and click Use "
+        .. "Target or type its exact character name.\n\n"
         .. "|cff72d68b2. Choose a material|r\n"
         .. "Browse categories, search all presets, or enter an exact item name, item ID, or shift-clicked item link. "
         .. "Right-click a preset to add or remove it from Favorites.\n\n"
@@ -1017,8 +1024,9 @@ function AF:CreateHelpFrame()
         .. "altbot dashboard. It requests one lightweight server snapshot every 15 seconds only while open, and its "
         .. "Auto button can disable polling.\n\n"
         .. "|cffffcc5cImportant|r\n"
-        .. "The bot must already be online through mod-playerbots and must know the required gathering profession. "
-        .. "It also needs tools such as a mining pick or skinning knife. Fishing presets only work when the item has "
+        .. "Named bots must already be online through mod-playerbots. Every farming character must know the required "
+        .. "gathering profession and have tools such as a mining pick or skinning knife. Fishing presets only work "
+        .. "when the item has "
         .. "an outdoor fishing-school source. Crafted-only, vendor-only, container-only, and open-water-only items may "
         .. "be rejected by the server.\n\n"
         .. "|cff8fbfffShortcuts|r\n"
@@ -1265,10 +1273,10 @@ function AF:CreateMainFrame()
 
     local targetTitle = targetPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     targetTitle:SetPoint("TOPLEFT", 14, -12)
-    targetTitle:SetText("PLAYERBOT")
+    targetTitle:SetText("FARMING CHARACTER")
     SetFontColor(targetTitle, COLORS.muted)
 
-    local botBox = CreateEditBox(targetPanel, 210, 29, "Blank = selected playerbot")
+    local botBox = CreateEditBox(targetPanel, 210, 29, "Blank = this character")
     botBox:SetPoint("TOPLEFT", 14, -33)
     botBox:SetText(self.db.botName or "")
     botBox:SetScript("OnEnterPressed", function(selfBox)
@@ -1282,7 +1290,7 @@ function AF:CreateMainFrame()
     targetButton:SetScript("OnClick", function()
         self:UseTarget()
     end)
-    AddTooltip(targetButton, "Use current target", "Copies the targeted player character into the bot-name field.")
+    AddTooltip(targetButton, "Use current target", "Copies the targeted player character into the name field.")
 
     local quantityTitle = targetPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     quantityTitle:SetPoint("TOPLEFT", 354, -12)
@@ -1319,7 +1327,7 @@ function AF:CreateMainFrame()
 
     local targetHint = targetPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     targetHint:SetPoint("BOTTOMLEFT", 14, 11)
-    targetHint:SetText("The bot must already be online through mod-playerbots. Zero means unlimited farming.")
+    targetHint:SetText("Blank auto-enables selfbot for this character. Zero means unlimited farming.")
     SetFontColor(targetHint, COLORS.dim)
 
     -- Material browser panel.

@@ -10,7 +10,8 @@ are suppressed; health and mana are restored between fights instead.
 
 - AzerothCore WotLK
 - `mod-playerbots`, enabled and configured to let the account add its own characters
-- A character logged in through playerbots, normally with `.playerbots bot add <name>`
+- For another character: a bot logged in through playerbots, normally with `.playerbots bot add <name>`
+- For the currently played character: selfbot permission through `AiPlayerbot.SelfBotLevel`
 - The required gathering profession and skill for ore, herbs, leather, or profession-skinned elementals
 - Required tools such as a mining pick or skinning knife
 
@@ -27,7 +28,8 @@ scale to fit the current display resolution and UI scale.
 
 ## Commands
 
-Select an owned playerbot, then use:
+These commands always farm with the character you are currently playing. Autofarm enables selfbot after validating the
+material and route, then disables that automatically enabled selfbot when farming stops:
 
 ```text
 .autofarm start copper ore
@@ -77,9 +79,11 @@ The quantity is the number newly collected during that session. Omit `--count` o
   restored out of combat, and all affected playerbot strategies return to their original state when farming stops.
 - Active sessions clear the AFK flag and periodically refresh the server activity timeout. This is the server-side
   equivalent of input for a playerbot, which has no client keyboard or network socket of its own.
-- Inactive mining/herbalism pool members remain in the route because they are possible future spawn locations. Missing
-  nodes are skipped when visited, and unreachable points are skipped instead of teleporting the bot into raw spawn
-  coordinates.
+- Inactive mining/herbalism pool members remain known to the route because they are possible future spawn locations,
+  but are skipped before travel until the pool activates them.
+- When a ground path remains unsafe after local recovery, autofarm tests nearby and zone-wide active sources and jumps
+  the route to a reachable node. It does not repeatedly advance through the same inaccessible pocket or teleport into
+  raw spawn coordinates.
 - Near a node, autofarm temporarily owns travel and mounting so loot cannot fight a simultaneous remount. Unsafe ground
   movement returns the bot to its last valid position before it can fall through terrain.
 - In Outland and Northrend, a bot with usable flying automatically takes off, cruises above sampled terrain, and lands
@@ -92,6 +96,8 @@ requiring a module update.
 ## Safety and limits
 
 - Only the bot's playerbot master may start or stop it; game masters may administer any online playerbot.
+- Starting on the currently played character automatically enables selfbot. Autofarm disables it on stop only when the
+  module enabled it; a selfbot that was already enabled manually is left enabled.
 - Battlegrounds, arenas, instances, taxis, combat starts, dead starts, and teleports already in progress are rejected.
 - Deliberate creature targets are limited to normal creatures at a configurable level range.
 - Instance maps are never selected, even if added to `Autofarm.AllowedMaps`.
