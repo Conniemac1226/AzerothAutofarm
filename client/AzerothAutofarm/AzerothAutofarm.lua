@@ -6,10 +6,11 @@ end
 local AF = CreateFrame("Frame", "AzerothAutofarmController")
 _G.AzerothAutofarm = AF
 
-local DATA = AzerothAutofarmData or { categories = {}, materials = {} }
+local DATA = AzerothAutofarmData or { categories = {}, materials = {}, reputations = {} }
 local ROW_HEIGHT = 29
 local ROW_COUNT = 9
 local FALLBACK_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+local REPUTATION_ICON = "Interface\\Icons\\Achievement_Reputation_01"
 local MAIN_FRAME_WIDTH = 860
 local MAIN_FRAME_HEIGHT = 675
 local LOG_FRAME_WIDTH = 700
@@ -63,7 +64,9 @@ local DEFAULTS = {
     quantity = "0",
     category = "mining",
     itemText = "2770",
+    reputationText = "",
     selectedItemId = 2770,
+    selectedFactionId = 0,
     favorites = {},
     frame = { point = "CENTER", relativePoint = "CENTER", x = 0, y = 0 },
     minimap = { shown = true, angle = 225 },
@@ -152,6 +155,34 @@ local function GetMaterialById(itemId)
         end
     end
 
+    return nil
+end
+
+local function GetReputationById(factionId)
+    factionId = tonumber(factionId)
+    if not factionId then
+        return nil
+    end
+
+    for _, reputation in ipairs(DATA.reputations or {}) do
+        if reputation.id == factionId then
+            return reputation
+        end
+    end
+    return nil
+end
+
+local function GetReputationByName(name)
+    local needle = Lower(Trim(name))
+    if needle == "" then
+        return nil
+    end
+
+    for _, reputation in ipairs(DATA.reputations or {}) do
+        if Lower(reputation.name) == needle then
+            return reputation
+        end
+    end
     return nil
 end
 
@@ -378,6 +409,18 @@ function AF:SendCommand(command, activity, silent)
     SendChatMessage(command, "SAY")
 end
 
+function AF:IsReputationMode()
+    return self.db and self.db.category == "reputation"
+end
+
+function AF:StartSelectedFarm()
+    if self:IsReputationMode() then
+        self:StartReputation()
+    else
+        self:StartFarm()
+    end
+end
+
 function AF:StartFarm()
     local itemText = Trim(self.itemBox:GetText()):gsub("[\r\n]", " ")
     if itemText == "" then
@@ -429,7 +472,7 @@ function AF:StartReputation()
     end
 
     self.db.botName = botName
-    self.db.itemText = factionText
+    self.db.reputationText = factionText
     self.statusUnavailable = false
     self:SendCommand(command, "Starting reputation route; waiting for the server...")
 end
@@ -461,18 +504,27 @@ function AF:StopAll()
 end
 
 function AF:SearchServer()
-    local itemText = Trim(self.itemBox:GetText()):gsub("[\r\n]", " ")
-    if itemText == "" then
-        self:SetActivity("Enter part of an item name before searching the server.", "error")
+    local selectionText = Trim(self.itemBox:GetText()):gsub("[\r\n]", " ")
+    if selectionText == "" then
+        self:SetActivity(
+            self:IsReputationMode() and "Enter part of a faction name before searching the server."
+                or "Enter part of an item name before searching the server.",
+            "error"
+        )
         return
     end
 
-    local itemId = GetItemId(itemText)
+    if self:IsReputationMode() then
+        self:SendCommand(".autofarm repsearch " .. selectionText, "Searching Vanilla reputation factions...")
+        return
+    end
+
+    local itemId = GetItemId(selectionText)
     local material = GetMaterialById(itemId)
-    local linkName = itemText:match("%[(.-)%]")
+    local linkName = selectionText:match("%[(.-)%]")
     local query = material and material.name
         or linkName
-        or itemText:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+        or selectionText:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
     query = query:gsub("|H.-|h", ""):gsub("|h", "")
     self:SendCommand(".autofarm search " .. query, "Searching the server item list...")
 end
@@ -495,14 +547,94 @@ function AF:UseTarget()
     self:SetActivity("Bot set to " .. name .. ".", "success")
 end
 
+function AF:UpdateModeControls()
+    local reputationMode = self:IsReputationMode()
+
+    if self.quantityTitle then
+        self.quantityTitle:SetText(reputationMode and "REPUTATION GOAL" or "NEW ITEMS TO GATHER")
+    end
+    if self.quantityBox then
+        if reputationMode then
+            self.quantityBox:Hide()
+        else
+            self.quantityBox:Show()
+        end
+    end
+    for _, button in ipairs(self.quickCountButtons or {}) do
+        if reputationMode then
+            button:Hide()
+        else
+            button:Show()
+        end
+    end
+    if self.reputationGoalText then
+        if reputationMode then
+            self.reputationGoalText:Show()
+        else
+            self.reputationGoalText:Hide()
+        end
+    end
+    if self.targetHint then
+        if reputationMode then
+            self.targetHint:SetText(
+                "Select a faction below. Autofarm targets its highest mob-kill standing and enables selfbot if needed."
+            )
+        else
+            self.targetHint:SetText("Blank auto-enables selfbot for this character. Zero means unlimited farming.")
+        end
+    end
+    if self.sidebarTip then
+        self.sidebarTip:SetText(
+            reputationMode and "Select a faction, then click\nStart Reputation"
+                or "Right-click a material\nto toggle Favorites"
+        )
+    end
+    if self.itemTitle then
+        self.itemTitle:SetText(reputationMode and "SELECTED REPUTATION FACTION" or "ITEM NAME, ID, OR LINK")
+    end
+    if self.itemBox and self.itemBox.placeholder then
+        self.itemBox.placeholder:SetText(
+            reputationMode and "Select a faction or enter its name or ID"
+                or "Choose a preset or enter a custom item"
+        )
+    end
+    if self.searchBox and self.searchBox.placeholder then
+        self.searchBox.placeholder:SetText(
+            reputationMode and "Search reputation factions by name or ID"
+                or "Search every preset by name, tier, or ID"
+        )
+    end
+    if self.searchServerButton then
+        self.searchServerButton:SetButtonText(reputationMode and "Search Reps" or "Search Server")
+    end
+    if self.primaryStartButton then
+        self.primaryStartButton:SetButtonText(reputationMode and "Start Reputation" or "Start Farming")
+    end
+end
+
 function AF:SetCategory(category)
+    local wasReputation = self:IsReputationMode()
+    if self.itemBox then
+        if wasReputation then
+            self.db.reputationText = Trim(self.itemBox:GetText())
+        else
+            self.db.itemText = Trim(self.itemBox:GetText())
+        end
+    end
+
     self.db.category = category
     if self.searchBox then
         self.searchBox:SetText("")
         self.searchBox:ClearFocus()
     end
+    if self.itemBox then
+        self.itemBox:SetText(self:IsReputationMode() and (self.db.reputationText or "") or (self.db.itemText or ""))
+        self.itemBox:ClearFocus()
+    end
+    self:UpdateModeControls()
     self:RefreshCategories()
     self:RefreshMaterials(true)
+    self:UpdateSelectedItem()
 end
 
 function AF:ToggleFavorite(itemId)
@@ -521,9 +653,15 @@ function AF:SelectMaterial(material)
         return
     end
 
-    self.db.selectedItemId = material.id
-    self.db.itemText = tostring(material.id)
-    self.itemBox:SetText(tostring(material.id))
+    if material.kind == "reputation" then
+        self.db.selectedFactionId = material.id
+        self.db.reputationText = material.name
+        self.itemBox:SetText(material.name)
+    else
+        self.db.selectedItemId = material.id
+        self.db.itemText = tostring(material.id)
+        self.itemBox:SetText(tostring(material.id))
+    end
     self.itemBox:ClearFocus()
     self:UpdateSelectedItem()
     self:RefreshMaterials(false)
@@ -536,6 +674,30 @@ function AF:UpdateSelectedItem()
     end
 
     local text = Trim(self.itemBox:GetText())
+    if self:IsReputationMode() then
+        local factionId = tonumber(text)
+        local reputation = GetReputationById(factionId) or GetReputationByName(text)
+        self.selectedIcon:SetTexture(REPUTATION_ICON)
+        if reputation then
+            self.db.selectedFactionId = reputation.id
+            self.selectedName:SetText(reputation.name)
+            self.selectedMeta:SetText(reputation.tier .. "  •  faction " .. reputation.id)
+            SetFontColor(self.selectedName, COLORS.text)
+        elseif text ~= "" then
+            self.db.selectedFactionId = 0
+            self.selectedName:SetText("Custom reputation faction")
+            self.selectedMeta:SetText("The server will resolve this faction name or ID")
+            SetFontColor(self.selectedName, COLORS.accentBright)
+        else
+            self.db.selectedFactionId = 0
+            self.selectedName:SetText("No reputation selected")
+            self.selectedMeta:SetText("Choose a faction from the list")
+            SetFontColor(self.selectedName, COLORS.muted)
+        end
+        self.db.reputationText = text
+        return
+    end
+
     local itemId = GetItemId(text)
     local material = GetMaterialById(itemId)
     self.selectedIcon:SetTexture(GetIcon(itemId))
@@ -568,6 +730,19 @@ function AF:GetFilteredMaterials()
     local query = Lower(Trim(self.searchBox and self.searchBox:GetText() or ""))
     local result = {}
 
+    if category == "reputation" then
+        for _, reputation in ipairs(DATA.reputations or {}) do
+            local queryMatches = query == ""
+                or Lower(reputation.name):find(query, 1, true) ~= nil
+                or tostring(reputation.id):find(query, 1, true) ~= nil
+                or Lower(reputation.tier):find(query, 1, true) ~= nil
+            if queryMatches then
+                table.insert(result, reputation)
+            end
+        end
+        return result
+    end
+
     for _, material in ipairs(DATA.materials) do
         local categoryMatches = category == "all" or material.category == category
         if category == "favorites" then
@@ -595,7 +770,7 @@ function AF:RefreshCategories()
         return
     end
 
-    local counts = { all = #DATA.materials, favorites = 0 }
+    local counts = { all = #DATA.materials, favorites = 0, reputation = #(DATA.reputations or {}) }
     for _, material in ipairs(DATA.materials) do
         counts[material.category] = (counts[material.category] or 0) + 1
     end
@@ -640,18 +815,23 @@ function AF:RefreshMaterials(resetScroll)
         row.material = material
         if material then
             row:Show()
-            row.icon:SetTexture(GetIcon(material.id))
+            row.icon:SetTexture(material.kind == "reputation" and REPUTATION_ICON or GetIcon(material.id))
             row.name:SetText(material.name)
             row.tier:SetText(material.tier)
             row.itemId:SetText(material.id)
-            row.star:SetText(self.db.favorites[tostring(material.id)] and "★" or "☆")
-            if self.db.favorites[tostring(material.id)] then
-                SetFontColor(row.star, COLORS.accentBright)
+            if material.kind == "reputation" then
+                row.star:SetText("")
             else
-                SetFontColor(row.star, COLORS.dim)
+                row.star:SetText(self.db.favorites[tostring(material.id)] and "★" or "☆")
+                if self.db.favorites[tostring(material.id)] then
+                    SetFontColor(row.star, COLORS.accentBright)
+                else
+                    SetFontColor(row.star, COLORS.dim)
+                end
             end
 
-            local selected = self.db.selectedItemId == material.id
+            local selected = material.kind == "reputation" and self.db.selectedFactionId == material.id
+                or material.kind ~= "reputation" and self.db.selectedItemId == material.id
             if selected then
                 row:SetBackdropColor(
                     COLORS.rowSelected[1], COLORS.rowSelected[2], COLORS.rowSelected[3], COLORS.rowSelected[4]
@@ -667,11 +847,15 @@ function AF:RefreshMaterials(resetScroll)
         end
     end
 
-    self.resultCount:SetText(#self.filteredMaterials .. " presets")
+    self.resultCount:SetText(
+        #self.filteredMaterials .. (self:IsReputationMode() and " factions" or " presets")
+    )
     if #self.filteredMaterials == 0 then
         self.emptyText:Show()
         if self.db.category == "favorites" then
             self.emptyText:SetText("No favorites yet\nRight-click any material to add one")
+        elseif self:IsReputationMode() then
+            self.emptyText:SetText("No reputation factions match this search")
         else
             self.emptyText:SetText("No materials match this search")
         end
@@ -735,6 +919,12 @@ function AF:RefreshActivityDashboard()
     local stalled = tonumber(status.stalled) or 0
 
     local reputationMode = status.mode == "reputation"
+    if self.activityMaterialLabel then
+        self.activityMaterialLabel:SetText(reputationMode and "REPUTATION" or "MATERIAL")
+    end
+    if self.activityVitalsLabel then
+        self.activityVitalsLabel:SetText(reputationMode and "HEALTH AND STANDING" or "HEALTH AND BAGS")
+    end
     if reputationMode then
         self.activityMaterial:SetText(
             (status.faction or status.item or "Unknown") .. "  •  faction " .. (status.factionid or "?")
@@ -896,15 +1086,15 @@ function AF:CreateLogFrame()
         value:SetJustifyH("LEFT")
         value:SetText("—")
         SetFontColor(value, COLORS.text)
-        return value
+        return value, label
     end
 
-    self.activityMaterial = CreateMetric("MATERIAL", 13, -47, 305)
+    self.activityMaterial, self.activityMaterialLabel = CreateMetric("MATERIAL", 13, -47, 305)
     self.activityProgress = CreateMetric("PROGRESS", 336, -47, 315)
     self.activityRoute = CreateMetric("ROUTE", 13, -87, 305)
     self.activityLocation = CreateMetric("LOCATION", 336, -87, 315)
     self.activitySource = CreateMetric("CURRENT SOURCE", 13, -127, 305)
-    self.activityVitals = CreateMetric("HEALTH AND BAGS", 336, -127, 315)
+    self.activityVitals, self.activityVitalsLabel = CreateMetric("HEALTH AND BAGS", 336, -127, 315)
     self.activityTime = CreateMetric("SESSION", 13, -167, 305)
     self.activityMovement = CreateMetric("MOVEMENT", 336, -167, 315)
 
@@ -1049,11 +1239,13 @@ function AF:CreateHelpFrame()
         .. "Leave the name blank to farm with the character you are playing; autofarm enables selfbot for the "
         .. "session and disables it when farming stops. To use another online playerbot, target it and click Use "
         .. "Target or type its exact character name.\n\n"
-        .. "|cff72d68b2. Choose a material|r\n"
-        .. "Browse categories, search all presets, or enter an exact item name, item ID, or shift-clicked item link. "
-        .. "Right-click a preset to add or remove it from Favorites.\n\n"
+        .. "|cff72d68b2. Choose what to farm|r\n"
+        .. "Browse material categories, or click Reputation and select a Vanilla faction. You can also enter an exact "
+        .. "item name, item ID, item link, faction name, or faction ID. Right-click a material preset to favorite "
+        .. "it.\n\n"
         .. "|cff72d68b3. Set the goal|r\n"
-        .. "The quantity is how many new items to gather during this session. Use zero for unlimited farming.\n\n"
+        .. "For materials, choose how many new items to gather or use zero for unlimited. Reputation automatically "
+        .. "targets the highest standing supported by that faction's outdoor mob-kill rewards.\n\n"
         .. "|cff72d68b4. Start and monitor|r\n"
         .. "Start Farming sends the request to mod-autofarm. Status checks progress. Stop returns that bot according "
         .. "to the server configuration; Stop All ends every farming session you own. Open Activity for a detailed "
@@ -1255,7 +1447,7 @@ function AF:CreateMainFrame()
 
     local categoriesTitle = sidebar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     categoriesTitle:SetPoint("TOPLEFT", 12, -12)
-    categoriesTitle:SetText("MATERIAL GROUPS")
+    categoriesTitle:SetText("FARMING TYPES")
     SetFontColor(categoriesTitle, COLORS.muted)
 
     self.categoryButtons = {}
@@ -1305,6 +1497,7 @@ function AF:CreateMainFrame()
     sidebarTip:SetJustifyH("LEFT")
     sidebarTip:SetText("Right-click a material\nto toggle Favorites")
     SetFontColor(sidebarTip, COLORS.dim)
+    self.sidebarTip = sidebarTip
 
     -- Bot and quantity panel.
     local targetPanel = CreateFrame("Frame", nil, frame)
@@ -1337,6 +1530,7 @@ function AF:CreateMainFrame()
     quantityTitle:SetPoint("TOPLEFT", 354, -12)
     quantityTitle:SetText("NEW ITEMS TO GATHER")
     SetFontColor(quantityTitle, COLORS.muted)
+    self.quantityTitle = quantityTitle
 
     local quantityBox = CreateEditBox(targetPanel, 72, 29, "0")
     quantityBox:SetPoint("TOPLEFT", 354, -33)
@@ -1354,6 +1548,7 @@ function AF:CreateMainFrame()
         { label = "200", value = "200" },
         { label = "∞", value = "0" },
     }
+    self.quickCountButtons = {}
     for index, quick in ipairs(quickCounts) do
         local button = CreateButton(targetPanel, quick.label, 48, 29)
         button:SetPoint("TOPLEFT", 434 + ((index - 1) * 53), -33)
@@ -1364,12 +1559,21 @@ function AF:CreateMainFrame()
         if quick.value == "0" then
             AddTooltip(button, "Unlimited", "Farm continuously until you press Stop.")
         end
+        table.insert(self.quickCountButtons, button)
     end
+
+    local reputationGoalText = targetPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    reputationGoalText:SetPoint("TOPLEFT", 354, -40)
+    reputationGoalText:SetText("Highest mob-kill standing")
+    SetFontColor(reputationGoalText, COLORS.accentBright)
+    reputationGoalText:Hide()
+    self.reputationGoalText = reputationGoalText
 
     local targetHint = targetPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     targetHint:SetPoint("BOTTOMLEFT", 14, 11)
     targetHint:SetText("Blank auto-enables selfbot for this character. Zero means unlimited farming.")
     SetFontColor(targetHint, COLORS.dim)
+    self.targetHint = targetHint
 
     -- Material browser panel.
     local materialPanel = CreateFrame("Frame", nil, frame)
@@ -1465,9 +1669,9 @@ function AF:CreateMainFrame()
         row.star:SetJustifyH("CENTER")
 
         row:SetScript("OnClick", function(selfRow, mouseButton)
-            if mouseButton == "RightButton" then
+            if mouseButton == "RightButton" and selfRow.material.kind ~= "reputation" then
                 self:ToggleFavorite(selfRow.material.id)
-            else
+            elseif mouseButton == "LeftButton" then
                 self:SelectMaterial(selfRow.material)
             end
         end)
@@ -1477,11 +1681,19 @@ function AF:CreateMainFrame()
             )
             GameTooltip:SetOwner(selfRow, "ANCHOR_RIGHT")
             GameTooltip:SetText(selfRow.material.name)
-            GameTooltip:AddLine(
-                "Item " .. selfRow.material.id .. " • " .. selfRow.material.tier,
-                COLORS.muted[1], COLORS.muted[2], COLORS.muted[3]
-            )
-            GameTooltip:AddLine("Left-click to select. Right-click to favorite.", 1, 1, 1, true)
+            if selfRow.material.kind == "reputation" then
+                GameTooltip:AddLine(
+                    "Faction " .. selfRow.material.id .. " • " .. selfRow.material.tier,
+                    COLORS.muted[1], COLORS.muted[2], COLORS.muted[3]
+                )
+                GameTooltip:AddLine("Left-click to select this mob-kill reputation.", 1, 1, 1, true)
+            else
+                GameTooltip:AddLine(
+                    "Item " .. selfRow.material.id .. " • " .. selfRow.material.tier,
+                    COLORS.muted[1], COLORS.muted[2], COLORS.muted[3]
+                )
+                GameTooltip:AddLine("Left-click to select. Right-click to favorite.", 1, 1, 1, true)
+            end
             GameTooltip:Show()
         end)
         row:SetScript("OnLeave", function(selfRow)
@@ -1509,12 +1721,13 @@ function AF:CreateMainFrame()
     itemTitle:SetPoint("TOPLEFT", 14, -10)
     itemTitle:SetText("ITEM, LINK, OR REPUTATION FACTION")
     SetFontColor(itemTitle, COLORS.muted)
+    self.itemTitle = itemTitle
 
     local itemBox = CreateEditBox(actionPanel, 298, 29, "Choose a preset or enter a custom item")
     itemBox:SetPoint("TOPLEFT", 14, -29)
-    itemBox:SetText(self.db.itemText or "2770")
+    itemBox:SetText(self:IsReputationMode() and (self.db.reputationText or "") or (self.db.itemText or "2770"))
     itemBox:SetScript("OnEnterPressed", function()
-        self:StartFarm()
+        self:StartSelectedFarm()
     end)
     itemBox:HookScript("OnTextChanged", function()
         self:UpdateSelectedItem()
@@ -1526,7 +1739,8 @@ function AF:CreateMainFrame()
     searchServer:SetScript("OnClick", function()
         self:SearchServer()
     end)
-    AddTooltip(searchServer, "Search server items", "Uses .autofarm search for names not listed in the presets.")
+    AddTooltip(searchServer, "Search server", "Searches server items or Vanilla reputation factions for this tab.")
+    self.searchServerButton = searchServer
 
     local selectedIcon = actionPanel:CreateTexture(nil, "ARTWORK")
     selectedIcon:SetSize(27, 27)
@@ -1547,23 +1761,13 @@ function AF:CreateMainFrame()
     SetFontColor(selectedMeta, COLORS.dim)
     self.selectedMeta = selectedMeta
 
-    local startButton = CreateButton(actionPanel, "Start Items", 112, 33, "primary")
+    local startButton = CreateButton(actionPanel, "Start Farming", 126, 33, "primary")
     startButton:SetPoint("TOPRIGHT", -14, -16)
     startButton:SetScript("OnClick", function()
-        self:StartFarm()
+        self:StartSelectedFarm()
     end)
-    AddTooltip(startButton, "Start farming", "Build a route and begin farming the selected material.")
-
-    local reputationButton = CreateButton(actionPanel, "Start Rep", 96, 33, "primary")
-    reputationButton:SetPoint("RIGHT", startButton, "LEFT", -7, 0)
-    reputationButton:SetScript("OnClick", function()
-        self:StartReputation()
-    end)
-    AddTooltip(
-        reputationButton,
-        "Start reputation farming",
-        "Enter a faction name or ID in the field. You may append --standing revered (or another standing)."
-    )
+    AddTooltip(startButton, "Start farming", "Starts the selected material or reputation route.")
+    self.primaryStartButton = startButton
 
     local statusButton = CreateButton(actionPanel, "Status", 75, 28)
     statusButton:SetPoint("BOTTOMRIGHT", -14, 12)
@@ -1600,6 +1804,7 @@ function AF:CreateMainFrame()
     self.activityText = activityText
 
     self.mainFrame = frame
+    self:UpdateModeControls()
     table.insert(UISpecialFrames, "AzerothAutofarmFrame")
 end
 
@@ -1668,6 +1873,7 @@ function AF:Toggle()
         self.mainFrame:Hide()
     else
         self.mainFrame:Show()
+        self:UpdateModeControls()
         self:RefreshCategories()
         self:RefreshMaterials(false)
         self:UpdateSelectedItem()

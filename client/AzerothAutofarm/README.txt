@@ -1,4 +1,4 @@
-AZEROTH AUTOFARM 1.2.0
+AZEROTH AUTOFARM 1.2.1
 ======================
 
 A standalone World of Warcraft 3.3.5a control panel for the AzerothCore
@@ -27,9 +27,10 @@ USAGE
 - Target an online playerbot and click Use Target, or type its exact name.
 - Select a material preset, or enter an item name, ID, or shift-clicked link.
 - Set a quantity goal. Zero means unlimited.
-- Click Start Items for a material route.
-- To farm reputation, enter a faction name or ID in the same field and click
-  Start Rep. Append --standing revered, honored, or exalted to set the goal.
+- Click Start Farming for a material route.
+- For reputation, click the Reputation tab, select a faction, and click Start
+  Reputation. The server chooses the highest standing supported by outdoor
+  mob-kill rewards for that faction.
 - Use Status, Stop, or Stop All to manage sessions.
 - Right-click material rows to add them to Favorites.
 - Click Activity to see commands and server replies.

@@ -26,10 +26,11 @@ that is logged in by the server as a playerbot, so it is neither required nor us
 
 The WotLK 3.3.5a `AzerothAutofarm` addon in `client/AzerothAutofarm/` provides a standalone graphical control panel for
 the commands below. It includes material presets, custom item/link input, favorites, quantity goals, bot selection,
-reputation starts, session controls, an activity log, help, and a minimap button. The Activity window adapts its
-progress, standing, and rate fields for reputation sessions. It has no external addon dependencies and does not perform
-movement or combat; it sends requests to this server module. Its main, Activity, and Help windows automatically scale
-to fit the current display resolution and UI scale.
+reputation starts, session controls, an activity log, help, and a minimap button. Reputation has its own tab containing
+the available Vanilla factions; selecting one changes the normal Start Farming workflow into Start Reputation. The
+Activity window adapts its progress, standing, and rate fields for reputation sessions. It has no external addon
+dependencies and does not perform movement or combat; it sends requests to this server module. Its main, Activity, and
+Help windows automatically scale to fit the current display resolution and UI scale.
 
 ## Commands
 

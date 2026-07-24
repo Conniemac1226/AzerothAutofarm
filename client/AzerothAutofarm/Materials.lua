@@ -2,6 +2,7 @@ AzerothAutofarmData = {
     categories = {
         { key = "favorites", name = "Favorites" },
         { key = "all", name = "All Materials" },
+        { key = "reputation", name = "Reputation" },
         { key = "mining", name = "Mining" },
         { key = "herbalism", name = "Herbalism" },
         { key = "leather", name = "Leather & Scales" },
@@ -10,6 +11,23 @@ AzerothAutofarmData = {
         { key = "elemental", name = "Elementals" },
         { key = "fishing", name = "Fishing Schools" },
         { key = "gems", name = "Gems" },
+    },
+
+    reputations = {
+        -- Vanilla outdoor factions with positive direct creature-kill rewards in the live world data.
+        { id = 21, name = "Booty Bay", tier = "Up to Honored", kind = "reputation" },
+        { id = 70, name = "Syndicate", tier = "Up to Neutral", kind = "reputation" },
+        { id = 87, name = "Bloodsail Buccaneers", tier = "Up to Exalted", kind = "reputation" },
+        { id = 92, name = "Gelkis Clan Centaur", tier = "Up to Honored", kind = "reputation" },
+        { id = 93, name = "Magram Clan Centaur", tier = "Up to Honored", kind = "reputation" },
+        { id = 349, name = "Ravenholdt", tier = "Up to Honored", kind = "reputation" },
+        { id = 369, name = "Gadgetzan", tier = "Up to Honored", kind = "reputation" },
+        { id = 470, name = "Ratchet", tier = "Up to Revered", kind = "reputation" },
+        { id = 529, name = "Argent Dawn", tier = "Up to Exalted", kind = "reputation" },
+        { id = 576, name = "Timbermaw Hold", tier = "Up to Exalted", kind = "reputation" },
+        { id = 609, name = "Cenarion Circle", tier = "Up to Exalted", kind = "reputation" },
+        { id = 729, name = "Frostwolf Clan", tier = "Up to Revered", kind = "reputation" },
+        { id = 749, name = "Hydraxian Waterlords", tier = "Up to Honored", kind = "reputation" },
     },
 
     materials = {
