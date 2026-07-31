@@ -89,12 +89,17 @@ activities. A normally friendly target must already be attackable, such as by ma
 - The selected route patrols every known possible source spawn in that zone, including inactive members of rotating
   spawn pools. When a zone exceeds `Autofarm.MaxRoutePoints`, points are spread across the whole zone instead of being
   taken only from its center. The route is then optimized as a closed loop to avoid a long straight return leg.
-- Ore and herbs: routes through nodes that directly contain the requested item.
+- Ore and herbs: routes through nodes that directly contain the requested item. Herb targets use only Herbalism
+  gameobjects, so herbable creatures and ordinary creature drops cannot displace skill-granting nodes from the route.
 - Cloth and meat: routes through suitable normal creatures whose corpse loot contains the requested item.
 - Leather and scales: routes through suitable skinnable creatures.
-- Elemental mining/herbalism and other gatherable raw items: uses the creature's required loot skill.
+- Elemental mining and other gatherable raw items: uses the creature's required loot skill. Herbalism target routes
+  deliberately exclude creature sources so the character gains skill from herb nodes.
 - Fishing schools and other usable outdoor gameobjects: supported when the item is in the object's loot template.
-- Incidental resources: while targeting copper, any usable nearby mining/herbalism node such as tin is still gathered.
+- Incidental resources: while targeting Peacebloom or copper, any usable nearby mining/herbalism node such as Silverleaf
+  or tin is still gathered. Herbalism routes also fill unused route slots with other usable herb nodes in the selected
+  zone, prioritizing those closest to target-item nodes. The selected material controls the zone and quantity goal,
+  not whether another farmable nearby node is gathered.
 - Mining and herbalism node routes temporarily make the bot and its active pet immune to NPC and player-controlled
   combat. The character remains visible to players and can continue interacting with nodes.
 - Creature corpses are fully looted and skinned when the character has the required profession.
@@ -111,6 +116,8 @@ activities. A normally friendly target must already be attackable, such as by ma
 - When a ground path remains unsafe after local recovery, autofarm tests nearby and zone-wide active sources and jumps
   the route to a reachable node. It does not repeatedly advance through the same inaccessible pocket or teleport into
   raw spawn coordinates.
+- Long ground routes use navmesh corner waypoints as intermediate recovery steps, allowing the bot to follow roads and
+  passes around hills instead of treating the direct line to a distant node as the only possible movement.
 - Near a node, autofarm temporarily owns travel and mounting so loot cannot fight a simultaneous remount. Unsafe ground
   movement returns the bot to its last valid position before it can fall through terrain.
 - In Outland and Northrend, a bot with usable flying automatically takes off, cruises above sampled terrain, and lands

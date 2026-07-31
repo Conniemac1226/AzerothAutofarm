@@ -175,31 +175,66 @@ namespace
         {
             float destinationZ = source.z;
             bot->UpdateAllowedPositionZ(source.x, source.y, destinationZ);
-            PathGenerator path(bot);
-            path.SetSlopeCheck(true);
-            if (path.CalculatePath(source.x, source.y, destinationZ, false))
+
+            auto moveAlongPath = [&](PathGenerator const& path)
             {
                 PathType type = path.GetPathType();
-                if (!path.GetPath().empty() && (type & PATHFIND_SHORT) &&
-                    !(type & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_NOT_USING_PATH)))
+                Movement::PointsArray const& points = path.GetPath();
+                if (points.size() < 2 ||
+                    (type & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_NOT_USING_PATH | PATHFIND_SHORT)))
+                    return false;
+
+                G3D::Vector3 previous = points.front();
+                G3D::Vector3 pathEnd = previous;
+                float traveled = 0.0f;
+                for (size_t index = 1; index < points.size(); ++index)
                 {
-                    G3D::Vector3 pathEnd = path.GetPath().front();
-                    for (G3D::Vector3 const& point : path.GetPath())
+                    G3D::Vector3 const& point = points[index];
+                    float deltaX = point.x - previous.x;
+                    float deltaY = point.y - previous.y;
+                    float deltaZ = point.z - previous.z;
+                    float segment = std::sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
+                    if (segment <= 0.01f)
                     {
-                        if (bot->GetExactDist2d(point.x, point.y) > AUTOFARM_GROUND_PATH_STEP_DISTANCE)
-                            break;
-                        pathEnd = point;
+                        previous = point;
+                        continue;
                     }
-                    float stepDistance = bot->GetExactDist2d(pathEnd.x, pathEnd.y);
-                    float remainingDistance = std::hypot(pathEnd.x - source.x, pathEnd.y - source.y);
-                    if (stepDistance >= 20.0f &&
-                        remainingDistance + 10.0f < bot->GetExactDist2d(source.x, source.y))
+
+                    if (traveled + segment > AUTOFARM_GROUND_PATH_STEP_DISTANCE)
                     {
-                        return MoveTo(source.mapId, pathEnd.x, pathEnd.y, pathEnd.z, false, false, true, false,
-                            MovementPriority::MOVEMENT_FORCED, true);
+                        float ratio = (AUTOFARM_GROUND_PATH_STEP_DISTANCE - traveled) / segment;
+                        pathEnd = G3D::Vector3(
+                            previous.x + (point.x - previous.x) * ratio,
+                            previous.y + (point.y - previous.y) * ratio,
+                            previous.z + (point.z - previous.z) * ratio);
+                        traveled = AUTOFARM_GROUND_PATH_STEP_DISTANCE;
+                        break;
                     }
+
+                    traveled += segment;
+                    pathEnd = point;
+                    previous = point;
                 }
-            }
+
+                if (traveled < 20.0f)
+                    return false;
+
+                return MoveTo(source.mapId, pathEnd.x, pathEnd.y, pathEnd.z, false, false, true, false,
+                    MovementPriority::MOVEMENT_FORCED, true);
+            };
+
+            PathGenerator path(bot);
+            path.SetSlopeCheck(true);
+            if (path.CalculatePath(source.x, source.y, destinationZ, false) && moveAlongPath(path))
+                return true;
+
+            // Long smooth paths are discarded by PathGenerator when they exceed its point cap. A straight-path
+            // planning pass retains the navmesh corner sequence; movement still uses a normal generated path to the
+            // intermediate corner, so this can follow a road around terrain without accepting obstacle shortcuts.
+            PathGenerator cornerPath(bot);
+            cornerPath.SetUseStraightPath(true);
+            if (cornerPath.CalculatePath(source.x, source.y, destinationZ, false) && moveAlongPath(cornerPath))
+                return true;
 
             float startAngle = std::atan2(bot->GetPositionY() - source.y, bot->GetPositionX() - source.x);
             for (uint8 index = 0; index < 8; ++index)
@@ -551,6 +586,21 @@ namespace
         return true;
     }
 
+    bool IsHerbalismRoute(std::vector<SourceSpawn> const& sources)
+    {
+        if (sources.empty())
+            return false;
+
+        return std::all_of(sources.begin(), sources.end(), [](SourceSpawn const& source)
+        {
+            if (!(source.sourceMask & SOURCE_GAMEOBJECT))
+                return false;
+
+            GameObjectTemplate const* gameObjectTemplate = sObjectMgr->GetGameObjectTemplate(source.entry);
+            return GetGameObjectGatheringSkill(gameObjectTemplate) == SKILL_HERBALISM;
+        });
+    }
+
     bool CanSkinCreature(Player const* bot, CreatureTemplate const* creatureTemplate)
     {
         if (!bot || !creatureTemplate || !creatureTemplate->SkinLootId)
@@ -820,6 +870,13 @@ namespace
                 handler->SendErrorMessage("No source spawn for [{}] is currently active in the selected zone.",
                     itemTemplate->Name1);
                 return false;
+            }
+
+            if (IsHerbalismRoute(selectedSources))
+            {
+                selectedSources = ExpandHerbalismRoute(bot, std::move(selectedSources));
+                firstActiveSource = std::find_if(selectedSources.begin(), selectedSources.end(),
+                    [](SourceSpawn const& source) { return IsSourceSpawnActive(source); });
             }
             std::rotate(selectedSources.begin(), firstActiveSource, selectedSources.end());
 
@@ -1621,6 +1678,10 @@ namespace
         {
             std::unordered_map<uint32, uint8> creatureEntries;
             std::unordered_set<uint32> gameObjectEntries;
+            std::unordered_set<uint32> herbalismNodeEntries;
+            ItemTemplate const* itemTemplate = sObjectMgr->GetItemTemplate(itemId);
+            bool herbalismTarget = itemTemplate && itemTemplate->Class == ITEM_CLASS_TRADE_GOODS &&
+                itemTemplate->SubClass == ITEM_SUBCLASS_HERB;
 
             if (CreatureTemplateContainer const* creatures = sObjectMgr->GetCreatureTemplates())
             {
@@ -1648,7 +1709,16 @@ namespace
                 {
                     ObjectGuid guid = ObjectGuid::Create<HighGuid::GameObject>(entry, uint32(1));
                     LootTemplateAccess const* loot = DropMapValue::GetLootTemplate(guid, LOOT_CORPSE);
-                    if (LootTemplateContainsItem(loot, itemId) && CanUseGameObject(bot, &gameObjectTemplate))
+                    if (!LootTemplateContainsItem(loot, itemId))
+                        continue;
+
+                    if (GetGameObjectGatheringSkill(&gameObjectTemplate) == SKILL_HERBALISM)
+                    {
+                        herbalismTarget = true;
+                        herbalismNodeEntries.insert(entry);
+                    }
+
+                    if (CanUseGameObject(bot, &gameObjectTemplate))
                         gameObjectEntries.insert(entry);
                 }
             }
@@ -1656,21 +1726,26 @@ namespace
             std::vector<SourceSpawn> sources;
             sources.reserve(sObjectMgr->GetAllCreatureData().size() / 20 + sObjectMgr->GetAllGOData().size() / 20);
 
-            for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+            if (!herbalismTarget)
             {
-                auto entry = creatureEntries.find(data.id);
-                if (entry == creatureEntries.end() || !entry->second || !MapAllowed(_config, data.mapid))
-                    continue;
-                if (!(data.phaseMask & PHASEMASK_NORMAL))
-                    continue;
+                for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+                {
+                    auto entry = creatureEntries.find(data.id);
+                    if (entry == creatureEntries.end() || !entry->second || !MapAllowed(_config, data.mapid))
+                        continue;
+                    if (!(data.phaseMask & PHASEMASK_NORMAL))
+                        continue;
 
-                sources.push_back({spawnId, data.id, data.mapid, data.posX, data.posY, data.posZ, data.orientation,
-                    entry->second});
+                    sources.push_back({spawnId, data.id, data.mapid, data.posX, data.posY, data.posZ,
+                        data.orientation, entry->second});
+                }
             }
 
             for (auto const& [spawnId, data] : sObjectMgr->GetAllGOData())
             {
                 if (!gameObjectEntries.contains(data.id) || !MapAllowed(_config, data.mapid))
+                    continue;
+                if (herbalismTarget && !herbalismNodeEntries.contains(data.id))
                     continue;
                 if (!(data.phaseMask & PHASEMASK_NORMAL))
                     continue;
@@ -1808,6 +1883,80 @@ namespace
             }
 
             return ordered;
+        }
+
+        std::vector<SourceSpawn> ExpandHerbalismRoute(Player* bot, std::vector<SourceSpawn> selectedSources) const
+        {
+            if (!bot || selectedSources.empty() || selectedSources.size() >= _config.maxRoutePoints)
+                return selectedSources;
+
+            uint32 mapId = selectedSources.front().mapId;
+            uint32 zoneId = GetSourceZoneId(selectedSources.front());
+            if (!zoneId)
+                return selectedSources;
+
+            std::unordered_set<ObjectGuid::LowType> selectedSpawnIds;
+            selectedSpawnIds.reserve(selectedSources.size());
+            for (SourceSpawn const& source : selectedSources)
+                selectedSpawnIds.insert(source.spawnId);
+
+            struct IncidentalNode
+            {
+                double nearestTargetDistance = 0.0;
+                SourceSpawn source;
+            };
+
+            std::vector<IncidentalNode> incidentalNodes;
+            for (auto const& [spawnId, data] : sObjectMgr->GetAllGOData())
+            {
+                if (data.mapid != mapId || selectedSpawnIds.contains(spawnId) ||
+                    !(data.phaseMask & PHASEMASK_NORMAL))
+                    continue;
+
+                GameObjectTemplate const* gameObjectTemplate = sObjectMgr->GetGameObjectTemplate(data.id);
+                if (GetGameObjectGatheringSkill(gameObjectTemplate) != SKILL_HERBALISM ||
+                    !CanUseGameObject(bot, gameObjectTemplate))
+                    continue;
+
+                SourceSpawn source = {spawnId, data.id, data.mapid, data.posX, data.posY, data.posZ,
+                    data.orientation, SOURCE_GAMEOBJECT};
+                if (GetSourceZoneId(source) != zoneId)
+                    continue;
+
+                double nearestTargetDistance = std::numeric_limits<double>::max();
+                for (SourceSpawn const& target : selectedSources)
+                {
+                    nearestTargetDistance = std::min(nearestTargetDistance,
+                        SquaredDistance(source.x, source.y, target.x, target.y));
+                }
+                incidentalNodes.push_back({nearestTargetDistance, source});
+            }
+
+            std::sort(incidentalNodes.begin(), incidentalNodes.end(),
+                [](IncidentalNode const& left, IncidentalNode const& right)
+                {
+                    return left.nearestTargetDistance < right.nearestTargetDistance;
+                });
+
+            size_t availableSlots = _config.maxRoutePoints - selectedSources.size();
+            size_t incidentalCount = std::min(availableSlots, incidentalNodes.size());
+            selectedSources.reserve(selectedSources.size() + incidentalCount);
+            for (size_t index = 0; index < incidentalCount; ++index)
+                selectedSources.push_back(incidentalNodes[index].source);
+
+            float centerX = 0.0f;
+            float centerY = 0.0f;
+            std::vector<size_t> indices;
+            indices.reserve(selectedSources.size());
+            for (size_t index = 0; index < selectedSources.size(); ++index)
+            {
+                centerX += selectedSources[index].x;
+                centerY += selectedSources[index].y;
+                indices.push_back(index);
+            }
+            centerX /= selectedSources.size();
+            centerY /= selectedSources.size();
+            return OrderZoneRoute(selectedSources, indices, centerX, centerY);
         }
 
         std::vector<SourceSpawn> SelectZone(Player* bot, std::vector<SourceSpawn> const& sources) const
@@ -2419,17 +2568,11 @@ namespace
                 return false;
 
             PathType type = path.GetPathType();
-            if (type & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_NOT_USING_PATH))
+            if (type & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_NOT_USING_PATH | PATHFIND_SHORT))
                 return false;
 
             G3D::Vector3 const& actualEnd = path.GetActualEndPosition();
             float remainingDistance = std::hypot(actualEnd.x - source.x, actualEnd.y - source.y);
-            if (type & PATHFIND_SHORT)
-            {
-                float directDistance = bot->GetExactDist2d(source.x, source.y);
-                return path.getPathLength() >= 20.0f && remainingDistance + 10.0f < directDistance;
-            }
-
             return remainingDistance <= AUTOFARM_GROUND_APPROACH_RADIUS + INTERACTION_DISTANCE;
         }
 
