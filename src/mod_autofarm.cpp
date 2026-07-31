@@ -565,6 +565,50 @@ namespace
         return bot->GetSkillValue(skill) >= requiredSkill;
     }
 
+    bool HasCreatureGatheringTool(Player const* bot, SkillType skill)
+    {
+        if (!bot)
+            return false;
+
+        auto hasAnyItem = [bot](auto const& itemIds)
+        {
+            return std::any_of(itemIds.begin(), itemIds.end(),
+                [bot](uint32 itemId) { return bot->HasItemCount(itemId, 1); });
+        };
+
+        if (skill == SKILL_MINING)
+        {
+            static constexpr std::array<uint32, 11> miningTools =
+                {756, 778, 1819, 1893, 1959, 2901, 9465, 20723, 40772, 40892, 40893};
+            return hasAnyItem(miningTools);
+        }
+
+        if (skill == SKILL_SKINNING)
+        {
+            static constexpr std::array<uint32, 5> skinningTools = {7005, 40772, 40893, 12709, 19901};
+            return hasAnyItem(skinningTools);
+        }
+
+        return true;
+    }
+
+    bool IsProfessionGatheringReady(Player const* bot, Creature const* creature, LootObject& loot)
+    {
+        if (!bot || !creature || loot.IsEmpty() ||
+            !creature->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SKINNABLE))
+            return false;
+
+        SkillType skill = creature->GetCreatureTemplate()->GetRequiredLootSkill();
+        if (skill == SKILL_NONE || loot.skillId != skill || !bot->HasSkill(skill) ||
+            bot->GetSkillValue(skill) < loot.reqSkillValue)
+            return false;
+
+        if (loot.reqItem && !bot->HasItemCount(loot.reqItem, 1))
+            return false;
+
+        return HasCreatureGatheringTool(bot, skill);
+    }
+
     double SquaredDistance(float firstX, float firstY, float secondX, float secondY)
     {
         double x = static_cast<double>(firstX) - secondX;
@@ -2827,21 +2871,64 @@ namespace
                 return;
             }
 
-            LootObject loot(bot, creature->GetGUID());
-            if (loot.IsEmpty() || !loot.IsLootPossible(bot))
+            bool professionGatheringSource = point.source.sourceMask & SOURCE_CREATURE_SKIN;
+            if (professionGatheringSource && bot->GetDistance(creature) > AUTOFARM_INTERACTION_DISTANCE)
             {
-                AdvanceRoute(botAI, session);
+                session.interactionStartedAtMs = 0;
+                session.sourceUnavailableStartedAtMs = 0;
+                AutofarmMovementAction movement(botAI);
+                movement.MoveToTarget(creature);
                 return;
             }
 
+            LootObject loot(bot, creature->GetGUID());
+            // LootObject's normal permission check exempts classic Skinning after corpse loot is exhausted, but not
+            // the other creature-gathering professions. Validate that ready state here without weakening the skill,
+            // required-item, or profession-tool checks.
+            bool professionGatheringReady = IsProfessionGatheringReady(bot, creature, loot);
+            if (loot.IsEmpty() || (!loot.IsLootPossible(bot) && !professionGatheringReady))
+            {
+                if (professionGatheringSource)
+                {
+                    // Profession-gathered corpses have two distinct loot stages. After normal corpse loot is
+                    // released, the core makes the corpse skinnable/herbable/mineable. Allow that flag transition
+                    // to complete instead of abandoning the route point during the brief unavailable interval.
+                    uint32 now = getMSTime();
+                    if (!session.sourceUnavailableStartedAtMs)
+                        session.sourceUnavailableStartedAtMs = now;
+                    else if (getMSTimeDiff(session.sourceUnavailableStartedAtMs, now) >= AUTOFARM_NODE_RETRY_MS)
+                        AdvanceRoute(botAI, session);
+                    return;
+                }
+
+                AdvanceRoute(botAI, session);
+                return;
+            }
+            session.sourceUnavailableStartedAtMs = 0;
+
             uint32 now = getMSTime();
+            bool interactionJustStarted = false;
             if (!session.interactionStartedAtMs)
             {
                 session.interactionStartedAtMs = now;
+                interactionJustStarted = true;
+            }
+
+            if (professionGatheringSource)
+            {
+                // Opening ordinary corpse loot removes it from playerbots' available-loot stack. Re-add and
+                // refresh the target on every stage so the subsequent profession cast is not lost.
+                botAI->GetAiObjectContext()->GetValue<LootObjectStack*>("available loot")->Get()
+                    ->Add(creature->GetGUID());
+                botAI->GetAiObjectContext()->GetValue<LootObject>("loot target")->Set(loot);
+                if (!bot->IsNonMeleeSpellCast(false))
+                    botAI->DoSpecificAction("open loot", Event(), true);
+            }
+            else if (interactionJustStarted)
+            {
                 botAI->GetAiObjectContext()->GetValue<LootObjectStack*>("available loot")->Get()
                     ->Add(creature->GetGUID());
                 botAI->DoSpecificAction("add all loot", Event(), true);
-                return;
             }
 
             if (getMSTimeDiff(session.interactionStartedAtMs, now) > _config.interactionTimeoutMs)
