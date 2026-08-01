@@ -2713,6 +2713,17 @@ namespace
                 return false;
 
             Player* bot = botAI->GetBot();
+            if (session.nodeApproachActive && bot->isMoving())
+            {
+                // A safe navmesh detour can initially increase straight-line distance to the source. Let the current
+                // intermediate waypoint finish instead of interrupting it as stalled and sending the bot back.
+                session.pointStartedAtMs = now;
+                return false;
+            }
+
+            if (session.passiveNodeGathering && !session.nodeApproachActive)
+                BeginNodeApproach(botAI, session);
+
             session.lastRouteDistance = distance;
             session.lastRouteProgressAtMs = now;
             ++session.stuckRecoveryAttempts;

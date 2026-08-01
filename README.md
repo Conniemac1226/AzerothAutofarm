@@ -118,8 +118,9 @@ activities. A normally friendly target must already be attackable, such as by ma
   raw spawn coordinates.
 - Long ground routes use navmesh corner waypoints as intermediate recovery steps, allowing the bot to follow roads and
   passes around hills instead of treating the direct line to a distant node as the only possible movement.
-- Near a node, autofarm temporarily owns travel and mounting so loot cannot fight a simultaneous remount. Unsafe ground
-  movement returns the bot to its last valid position before it can fall through terrain.
+- During forced ground recovery and near a node, autofarm temporarily owns travel and mounting so the normal travel
+  strategy cannot reverse a navmesh detour and loot cannot fight a simultaneous remount. Unsafe ground movement returns
+  the bot to its last valid position before it can fall through terrain.
 - In Outland and Northrend, a bot with usable flying automatically takes off, cruises above sampled terrain, and lands
   at the selected source. Unrelated attackers do not make it dismount; if it is forced off the mount, its original
   combat strategies are restored so it can defend itself.
