@@ -303,6 +303,7 @@ namespace
         bool passiveNodeGathering = false;
         bool selfbotEnabledByAutofarm = false;
         bool nodeApproachActive = false;
+        bool routeExhausted = false;
         bool npcImmunityApplied = false;
         bool pcImmunityApplied = false;
         ObjectGuid petGuid;
@@ -319,7 +320,7 @@ namespace
         std::vector<StrategyState> strategies;
         std::vector<std::string> combatStrategies;
         std::vector<RoutePoint> route;
-        std::unordered_set<size_t> temporarilyUnreachableRoutePoints;
+        std::unordered_set<size_t> unreachableRoutePoints;
     };
 
     struct ZoneKey
@@ -2583,7 +2584,7 @@ namespace
             candidates.reserve(session.route.size());
             for (size_t index = 0; index < session.route.size(); ++index)
             {
-                if (index == failedRouteIndex || session.temporarilyUnreachableRoutePoints.contains(index))
+                if (index == failedRouteIndex || session.unreachableRoutePoints.contains(index))
                     continue;
 
                 SourceSpawn const& source = session.route[index].source;
@@ -2610,7 +2611,7 @@ namespace
                 ++session.pathReroutes;
                 SetTravelTarget(botAI, session);
                 LOG_WARN("module.autofarm",
-                    "Bot {} rerouted from unreachable point {}/{} to reachable point {}/{} in the same zone",
+                    "Bot {} quarantined unreachable point {}/{} for this session and rerouted to point {}/{}",
                     bot->GetName(), previousRouteIndex + 1, session.route.size(), routeIndex + 1,
                     session.route.size());
                 return true;
@@ -2638,6 +2639,13 @@ namespace
             botAI->GetAiObjectContext()->GetValue<ObjectGuid>("pull target")->Reset();
             botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({});
 
+            if (session.unreachableRoutePoints.size() >= session.route.size())
+            {
+                session.routeExhausted = true;
+                TravelMgr::instance().setNullTravelTarget(botAI->GetBot());
+                return;
+            }
+
             size_t checked = 0;
             while (checked < session.route.size())
             {
@@ -2646,11 +2654,10 @@ namespace
                 {
                     session.routeIndex = 0;
                     ++session.completedLoops;
-                    session.temporarilyUnreachableRoutePoints.clear();
                 }
 
                 ++checked;
-                if (!session.temporarilyUnreachableRoutePoints.contains(session.routeIndex) &&
+                if (!session.unreachableRoutePoints.contains(session.routeIndex) &&
                     IsSourceSpawnActive(session.route[session.routeIndex].source))
                     break;
             }
@@ -2735,12 +2742,12 @@ namespace
             if (session.stuckRecoveryAttempts >= AUTOFARM_RETRIES_BEFORE_SKIP)
             {
                 size_t failedRouteIndex = session.routeIndex;
-                session.temporarilyUnreachableRoutePoints.insert(failedRouteIndex);
+                session.unreachableRoutePoints.insert(failedRouteIndex);
                 if (RerouteToReachablePoint(botAI, session, failedRouteIndex))
                     return true;
 
                 LOG_WARN("module.autofarm",
-                    "Bot {} could not find a safe path from route point {}/{} to another active source; advancing",
+                    "Bot {} quarantined unreachable point {}/{} for this session; no safe reroute found, advancing",
                     bot->GetName(), failedRouteIndex + 1, session.route.size());
                 AdvanceRoute(botAI, session);
                 return true;
@@ -2807,6 +2814,9 @@ namespace
             PlayerbotAI* botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
             if (!botAI)
                 return "playerbot AI is no longer available";
+
+            if (session.routeExhausted)
+                return "all route points became unreachable during this session";
 
             MaintainPlayerOverrides(botAI, session);
 

@@ -115,7 +115,8 @@ activities. A normally friendly target must already be attackable, such as by ma
   but are skipped before travel until the pool activates them.
 - When a ground path remains unsafe after local recovery, autofarm tests nearby and zone-wide active sources and jumps
   the route to a reachable node. It does not repeatedly advance through the same inaccessible pocket or teleport into
-  raw spawn coordinates.
+  raw spawn coordinates. A point confirmed unreachable is quarantined for the remainder of that session instead of
+  being retried on every route loop.
 - Long ground routes use navmesh corner waypoints as intermediate recovery steps, allowing the bot to follow roads and
   passes around hills instead of treating the direct line to a distant node as the only possible movement.
 - During forced ground recovery and near a node, autofarm temporarily owns travel and mounting so the normal travel
