@@ -13,6 +13,12 @@ Autofarm.Enable = 1
 # Default: 1
 Autofarm.TeleportToRoute = 1
 
+# If normal ground movement and forced path recovery both fail, teleport to a nearby landing point only when terrain,
+# water, elevation, and navmesh checks prove that the point is safe and walkable to the source. If no safe landing is
+# found, the route point is quarantined for the rest of the session.
+# Default: 1
+Autofarm.TeleportOnUnreachable = 1
+
 # Return the bot to its original location when stopped or when its quantity goal is reached.
 # Default: 1
 Autofarm.ReturnOnStop = 1
@@ -29,11 +35,11 @@ Autofarm.SuppressRestAndBuffs = 1
 # Default: 1
 Autofarm.PassiveNodeGathering = 1
 
-# Keep an autofarming character out of AFK state and refresh its server session activity timer.
-# Playerbots have no client keyboard to press, so this is the server-side equivalent of periodic input.
-# Set to 0 to disable. Non-zero values below 10000 are raised to 10000 milliseconds.
-# Default: 60000
-Autofarm.KeepAliveIntervalMs = 60000
+# Refresh an autofarming character's server session activity timer. The effective interval is limited to half of the
+# world's active socket timeout so the connection cannot expire immediately before a refresh. Set to 0 to disable
+# socket-timeout refreshes; active autofarm sessions still suppress playerbots' AFK activity rotation.
+# Default: 30000
+Autofarm.KeepAliveIntervalMs = 30000
 
 # Use a known flying mount or flight form for route travel in Outland and Northrend.
 # The bot takes off for travel, lands only at the selected source, and ignores unrelated

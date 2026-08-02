@@ -109,14 +109,15 @@ activities. A normally friendly target must already be attackable, such as by ma
 - Combat, attackers encountered on the route, death, and recovery are handled by the bot's normal class AI.
 - Food, drink, random grinding, and repetitive non-combat buffing are disabled during autofarm. Health and mana are
   restored out of combat, and all affected playerbot strategies return to their original state when farming stops.
-- Active sessions clear the AFK flag and periodically refresh the server activity timeout. This is the server-side
-  equivalent of input for a playerbot, which has no client keyboard or network socket of its own.
+- Active sessions temporarily force the bot out of playerbots' passive activity rotation, clear the AFK flag, and
+  periodically refresh the server activity timeout at no more than half the active socket timeout. Any prior playerbots
+  master is restored when farming stops.
 - Inactive mining/herbalism pool members remain known to the route because they are possible future spawn locations,
   but are skipped before travel until the pool activates them.
-- When a ground path remains unsafe after local recovery, autofarm tests nearby and zone-wide active sources and jumps
-  the route to a reachable node. It does not repeatedly advance through the same inaccessible pocket or teleport into
-  raw spawn coordinates. A point confirmed unreachable is quarantined for the remainder of that session instead of
-  being retried on every route loop.
+- When normal ground movement and forced path recovery both fail, autofarm may teleport near the source, but only to a
+  landing point validated against terrain, water, elevation, and the navmesh path to the source. It never uses raw spawn
+  coordinates for recovery. If no safe landing can be proven, autofarm tests other active sources and quarantines the
+  unreachable point for the remainder of that session instead of retrying it on every route loop.
 - Long ground routes use navmesh corner waypoints as intermediate recovery steps, allowing the bot to follow roads and
   passes around hills instead of treating the direct line to a distant node as the only possible movement.
 - During forced ground recovery and near a node, autofarm temporarily owns travel and mounting so the normal travel

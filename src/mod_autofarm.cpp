@@ -33,6 +33,7 @@
 #include "ScriptMgr.h"
 #include "StringFormat.h"
 #include "Timer.h"
+#include "World.h"
 #include "WorldScript.h"
 #include "WorldSession.h"
 
@@ -73,6 +74,7 @@ namespace
     constexpr size_t AUTOFARM_NEAREST_PATH_CANDIDATES = 16;
     constexpr size_t AUTOFARM_DIVERSE_PATH_CANDIDATES = 48;
     constexpr float AUTOFARM_GROUND_PATH_STEP_DISTANCE = 180.0f;
+    constexpr float AUTOFARM_TELEPORT_MAX_VERTICAL_OFFSET = 15.0f;
 
     enum class FlightStage : uint8
     {
@@ -93,6 +95,7 @@ namespace
     {
         bool enabled = true;
         bool teleportToRoute = true;
+        bool teleportOnUnreachable = true;
         bool returnOnStop = true;
         bool useFlyingMounts = true;
         bool suppressRestAndBuffs = true;
@@ -107,7 +110,7 @@ namespace
         uint32 interactionTimeoutMs = 15000;
         uint32 routePointTimeoutMs = 120000;
         uint32 flightCombatEscapeMs = 6000;
-        uint32 keepAliveIntervalMs = 60000;
+        uint32 keepAliveIntervalMs = 30000;
         std::unordered_set<uint32> allowedMaps = {0, 1, 530, 571};
     };
 
@@ -303,10 +306,13 @@ namespace
         bool passiveNodeGathering = false;
         bool selfbotEnabledByAutofarm = false;
         bool nodeApproachActive = false;
+        bool routePointTeleportAttempted = false;
         bool routeExhausted = false;
+        bool activityMasterOverridden = false;
         bool npcImmunityApplied = false;
         bool pcImmunityApplied = false;
         ObjectGuid petGuid;
+        ObjectGuid originalMasterGuid;
         bool petNpcImmunityApplied = false;
         bool petPcImmunityApplied = false;
         FlightStage flightStage = FlightStage::None;
@@ -742,6 +748,8 @@ namespace
         {
             _config.enabled = sConfigMgr->GetOption<bool>("Autofarm.Enable", true);
             _config.teleportToRoute = sConfigMgr->GetOption<bool>("Autofarm.TeleportToRoute", true);
+            _config.teleportOnUnreachable =
+                sConfigMgr->GetOption<bool>("Autofarm.TeleportOnUnreachable", true);
             _config.returnOnStop = sConfigMgr->GetOption<bool>("Autofarm.ReturnOnStop", true);
             _config.useFlyingMounts = sConfigMgr->GetOption<bool>("Autofarm.UseFlyingMounts", true);
             _config.suppressRestAndBuffs =
@@ -768,9 +776,17 @@ namespace
             _config.flightCombatEscapeMs = std::max<uint32>(2000,
                 sConfigMgr->GetOption<uint32>("Autofarm.FlightCombatEscapeMs", 6000));
             _config.keepAliveIntervalMs =
-                sConfigMgr->GetOption<uint32>("Autofarm.KeepAliveIntervalMs", 60000);
+                sConfigMgr->GetOption<uint32>("Autofarm.KeepAliveIntervalMs", 30000);
             if (_config.keepAliveIntervalMs)
-                _config.keepAliveIntervalMs = std::max<uint32>(10000, _config.keepAliveIntervalMs);
+            {
+                _config.keepAliveIntervalMs = std::max<uint32>(1000, _config.keepAliveIntervalMs);
+                uint32 activeSocketTimeout = sWorld->getIntConfig(CONFIG_SOCKET_TIMEOUTTIME_ACTIVE);
+                if (activeSocketTimeout)
+                {
+                    uint32 safeMaximum = std::max<uint32>(1000, activeSocketTimeout / 2);
+                    _config.keepAliveIntervalMs = std::min(_config.keepAliveIntervalMs, safeMaximum);
+                }
+            }
 
             _config.allowedMaps.clear();
             std::string allowedMaps = sConfigMgr->GetOption<std::string>("Autofarm.AllowedMaps", "0,1,530,571");
@@ -908,6 +924,7 @@ namespace
             session->selfbotEnabledByAutofarm = selfbotEnabled;
             BuildRoute(*session, std::move(selectedSources));
 
+            ApplyActivityOverride(botAI, *session);
             CaptureAndApplyStrategies(botAI, *session);
             ApplyPlayerOverrides(botAI, *session);
 
@@ -1075,6 +1092,7 @@ namespace
             session->selfbotEnabledByAutofarm = selfbotEnabled;
             BuildRoute(*session, std::move(selectedSources));
 
+            ApplyActivityOverride(botAI, *session);
             CaptureAndApplyStrategies(botAI, *session);
             ApplyPlayerOverrides(botAI, *session);
 
@@ -2343,6 +2361,23 @@ namespace
             }
         }
 
+        static void ApplyActivityOverride(PlayerbotAI* botAI, FarmSession& session)
+        {
+            Player* bot = botAI->GetBot();
+            Player* owner = ObjectAccessor::FindConnectedPlayer(session.ownerGuid);
+            if (!botAI->HasRealPlayerMaster() && owner)
+            {
+                if (Player* originalMaster = botAI->GetMaster())
+                    session.originalMasterGuid = originalMaster->GetGUID();
+
+                botAI->SetMaster(owner);
+                session.activityMasterOverridden = true;
+            }
+
+            botAI->AllowActivity(ALL_ACTIVITY, true);
+            bot->RemovePlayerFlag(PLAYER_FLAGS_AFK);
+        }
+
         void ApplyPlayerOverrides(PlayerbotAI* botAI, FarmSession& session) const
         {
             Player* bot = botAI->GetBot();
@@ -2415,11 +2450,20 @@ namespace
         void MaintainPlayerOverrides(PlayerbotAI* botAI, FarmSession& session) const
         {
             Player* bot = botAI->GetBot();
+            if (session.activityMasterOverridden)
+            {
+                if (Player* owner = ObjectAccessor::FindConnectedPlayer(session.ownerGuid))
+                    if (botAI->GetMaster() != owner)
+                        botAI->SetMaster(owner);
+            }
+
+            // Playerbots marks bots AFK whenever its activity rotation makes them passive. Autofarm sessions must stay
+            // active regardless of that rotation, so refresh the cached decision before clearing the flag.
+            botAI->AllowActivity(ALL_ACTIVITY, true);
+            bot->RemovePlayerFlag(PLAYER_FLAGS_AFK);
+
             if (_config.keepAliveIntervalMs)
             {
-                if (bot->isAFK())
-                    bot->ToggleAFK();
-
                 uint32 now = getMSTime();
                 if (!session.lastKeepAliveAtMs ||
                     getMSTimeDiff(session.lastKeepAliveAtMs, now) >= _config.keepAliveIntervalMs)
@@ -2485,6 +2529,16 @@ namespace
         {
             if (!botAI)
                 return;
+
+            if (session.activityMasterOverridden)
+            {
+                Player* originalMaster = session.originalMasterGuid.IsEmpty() ? nullptr :
+                    ObjectAccessor::FindConnectedPlayer(session.originalMasterGuid);
+                botAI->SetMaster(originalMaster);
+                botAI->AllowActivity(ALL_ACTIVITY, true);
+                session.activityMasterOverridden = false;
+                session.originalMasterGuid.Clear();
+            }
 
             RestoreFlightCombatStrategies(botAI, session);
             TravelMgr::instance().setNullTravelTarget(botAI->GetBot());
@@ -2577,6 +2631,101 @@ namespace
             return remainingDistance <= AUTOFARM_GROUND_APPROACH_RADIUS + INTERACTION_DISTANCE;
         }
 
+        static bool FindSafeTeleportLanding(Player* bot, SourceSpawn const& source, WorldLocation& landing)
+        {
+            if (!bot || bot->GetMapId() != source.mapId)
+                return false;
+
+            Map* map = bot->GetMap();
+            if (!map)
+                return false;
+
+            float sourceGroundZ = map->GetHeight(bot->GetPhaseMask(), source.x, source.y, source.z + 5.0f,
+                true, AUTOFARM_TELEPORT_MAX_VERTICAL_OFFSET + 5.0f);
+            if (!IsValidHeight(sourceGroundZ) ||
+                std::abs(sourceGroundZ - source.z) > AUTOFARM_TELEPORT_MAX_VERTICAL_OFFSET)
+                return false;
+
+            constexpr std::array<float, 4> landingRadii = { 6.0f, 10.0f, 14.0f, 20.0f };
+            constexpr uint8 landingAngles = 16;
+            float startAngle = std::atan2(bot->GetPositionY() - source.y, bot->GetPositionX() - source.x);
+
+            for (float radius : landingRadii)
+            {
+                for (uint8 index = 0; index < landingAngles; ++index)
+                {
+                    float angle = startAngle + static_cast<float>(index) *
+                        static_cast<float>(2.0 * M_PI / landingAngles);
+                    float x = source.x + std::cos(angle) * radius;
+                    float y = source.y + std::sin(angle) * radius;
+                    float z = map->GetHeight(bot->GetPhaseMask(), x, y, sourceGroundZ + 5.0f, true,
+                        AUTOFARM_TELEPORT_MAX_VERTICAL_OFFSET + 5.0f);
+                    if (!IsValidHeight(z) ||
+                        std::abs(z - sourceGroundZ) > AUTOFARM_TELEPORT_MAX_VERTICAL_OFFSET ||
+                        !MapMgr::IsValidMapCoord(source.mapId, x, y, z + 0.5f) ||
+                        map->IsInWater(bot->GetPhaseMask(), x, y, z, bot->GetCollisionHeight()))
+                        continue;
+
+                    PathGenerator path(bot);
+                    path.SetSlopeCheck(true);
+                    if (!path.CalculatePath(x, y, z, source.x, source.y, sourceGroundZ, false))
+                        continue;
+
+                    PathType type = path.GetPathType();
+                    if (type & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_NOT_USING_PATH | PATHFIND_SHORT |
+                        PATHFIND_FARFROMPOLY))
+                        continue;
+
+                    G3D::Vector3 const& actualEnd = path.GetActualEndPosition();
+                    if (std::hypot(actualEnd.x - source.x, actualEnd.y - source.y) >
+                        AUTOFARM_GROUND_APPROACH_RADIUS + INTERACTION_DISTANCE ||
+                        std::abs(actualEnd.z - sourceGroundZ) > 3.0f)
+                        continue;
+
+                    landing = WorldLocation(source.mapId, x, y, z + 0.5f,
+                        Position::NormalizeOrientation(angle + static_cast<float>(M_PI)));
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        static bool TeleportToSafeRouteLanding(PlayerbotAI* botAI, FarmSession& session,
+            RoutePoint const& point, uint32 now)
+        {
+            Player* bot = botAI->GetBot();
+            if (!bot || bot->IsInCombat() || bot->IsBeingTeleported())
+                return false;
+
+            WorldLocation landing;
+            if (!FindSafeTeleportLanding(bot, point.source, landing))
+                return false;
+
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+            bot->RemoveUnitMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
+            botAI->GetAiObjectContext()->GetValue<LastMovement&>("last movement")->Get().clear();
+            bot->NearTeleportTo(landing.GetPositionX(), landing.GetPositionY(), landing.GetPositionZ(),
+                landing.GetOrientation(), false, false, true, true);
+
+            session.lastSafeLocation = landing;
+            session.hasLastSafeLocation = true;
+            session.lastRouteDistance = std::numeric_limits<float>::max();
+            session.lastRouteProgressAtMs = now;
+            session.pointStartedAtMs = now;
+            session.stuckRecoveryAttempts = 0;
+            session.interactionStartedAtMs = 0;
+            SetTravelTarget(botAI, session);
+            if (session.passiveNodeGathering && (point.source.sourceMask & SOURCE_GAMEOBJECT))
+                BeginNodeApproach(botAI, session);
+
+            LOG_WARN("module.autofarm",
+                "Bot {} safely teleported near unreachable route point {}/{} after path recovery failed",
+                bot->GetName(), session.routeIndex + 1, session.route.size());
+            return true;
+        }
+
         bool RerouteToReachablePoint(PlayerbotAI* botAI, FarmSession& session, size_t failedRouteIndex)
         {
             Player* bot = botAI->GetBot();
@@ -2608,6 +2757,7 @@ namespace
 
                 size_t previousRouteIndex = session.routeIndex;
                 session.routeIndex = routeIndex;
+                session.routePointTeleportAttempted = false;
                 ++session.pathReroutes;
                 SetTravelTarget(botAI, session);
                 LOG_WARN("module.autofarm",
@@ -2638,6 +2788,7 @@ namespace
         {
             botAI->GetAiObjectContext()->GetValue<ObjectGuid>("pull target")->Reset();
             botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({});
+            session.routePointTeleportAttempted = false;
 
             if (session.unreachableRoutePoints.size() >= session.route.size())
             {
@@ -2741,6 +2892,13 @@ namespace
 
             if (session.stuckRecoveryAttempts >= AUTOFARM_RETRIES_BEFORE_SKIP)
             {
+                if (_config.teleportOnUnreachable && !session.routePointTeleportAttempted &&
+                    TeleportToSafeRouteLanding(botAI, session, point, now))
+                {
+                    session.routePointTeleportAttempted = true;
+                    return true;
+                }
+
                 size_t failedRouteIndex = session.routeIndex;
                 session.unreachableRoutePoints.insert(failedRouteIndex);
                 if (RerouteToReachablePoint(botAI, session, failedRouteIndex))
