@@ -2365,7 +2365,7 @@ namespace
         {
             Player* bot = botAI->GetBot();
             Player* owner = ObjectAccessor::FindConnectedPlayer(session.ownerGuid);
-            if (!botAI->HasRealPlayerMaster() && owner)
+            if (!botAI->HasGameClientMaster() && owner)
             {
                 if (Player* originalMaster = botAI->GetMaster())
                     session.originalMasterGuid = originalMaster->GetGUID();
