@@ -128,14 +128,16 @@ namespace
 
     bool IsSourceSpawnActive(SourceSpawn const& source)
     {
+        Map const* map = sMapMgr->CreateBaseMap(source.mapId);
+
         if (source.sourceMask & SOURCE_GAMEOBJECT)
         {
             return !sPoolMgr->IsPartOfAPool<GameObject>(source.spawnId) ||
-                sPoolMgr->IsSpawnedObject<GameObject>(source.spawnId);
+                map->GetPoolData().IsSpawnedObject<GameObject>(source.spawnId);
         }
 
         return !sPoolMgr->IsPartOfAPool<Creature>(source.spawnId) ||
-            sPoolMgr->IsSpawnedObject<Creature>(source.spawnId);
+            map->GetPoolData().IsSpawnedObject<Creature>(source.spawnId);
     }
 
     class AutofarmDestination final : public TravelDestination
