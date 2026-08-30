@@ -85,16 +85,19 @@ activities. A normally friendly target must already be attackable, such as by ma
 
 - Every session chooses exactly one zone and remains there. Candidate zones are ranked by usable source density,
   average distance between nearby sources, terrain grade, total elevation range, and overall zone spread, with a small
-  faction-location preference. The route therefore favors a flatter, well-connected zone.
+  faction-location preference. Mining and Herbalism routes first discard substantially lower-capacity zones, then use
+  those travel metrics to choose among the remaining rich zones. The route therefore favors a flatter,
+  well-connected zone without sacrificing too much respawn capacity.
 - The selected route patrols every known possible source spawn in that zone, including inactive members of rotating
   spawn pools. When a zone exceeds `Autofarm.MaxRoutePoints`, points are spread across the whole zone instead of being
   taken only from its center. The route is then optimized as a closed loop to avoid a long straight return leg.
-- Ore and herbs: routes through nodes that directly contain the requested item. Herb targets use only Herbalism
-  gameobjects, so herbable creatures and ordinary creature drops cannot displace skill-granting nodes from the route.
+- Ore and herbs: routes through mining or Herbalism nodes that directly contain the requested item. Profession-node
+  targets use only the matching node type, so chests, creatures, and ordinary creature drops cannot displace
+  skill-granting nodes from the route.
 - Cloth and meat: routes through suitable normal creatures whose corpse loot contains the requested item.
 - Leather and scales: routes through suitable skinnable creatures.
-- Elemental mining and other gatherable raw items: uses the creature's required loot skill. Herbalism target routes
-  deliberately exclude creature sources so the character gains skill from herb nodes.
+- Elemental mining and other gatherable raw items: uses the creature's required loot skill. Mining and Herbalism
+  target routes deliberately exclude creature sources so the character gains skill from profession nodes.
 - Fishing schools and other usable outdoor gameobjects: supported when the item is in the object's loot template.
 - Incidental resources: while targeting Peacebloom or copper, any usable nearby mining/herbalism node such as Silverleaf
   or tin is still gathered. Herbalism routes also fill unused route slots with other usable herb nodes in the selected

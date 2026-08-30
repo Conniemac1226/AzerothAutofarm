@@ -69,6 +69,7 @@ namespace
     constexpr float AUTOFARM_FLIGHT_LANDING_HEIGHT = 3.0f;
     constexpr uint32 AUTOFARM_STUCK_TIMEOUT_MS = 8 * IN_MILLISECONDS;
     constexpr uint32 AUTOFARM_NODE_RETRY_MS = 3 * IN_MILLISECONDS;
+    constexpr uint32 AUTOFARM_NODE_APPROACH_MOVEMENT_GRACE_MS = 30 * IN_MILLISECONDS;
     constexpr uint8 AUTOFARM_RETRIES_BEFORE_SKIP = 4;
     constexpr float AUTOFARM_GROUND_APPROACH_RADIUS = 6.0f;
     constexpr size_t AUTOFARM_NEAREST_PATH_CANDIDATES = 16;
@@ -296,6 +297,7 @@ namespace
         uint32 pointStartedAtMs = 0;
         uint32 interactionStartedAtMs = 0;
         uint32 sourceUnavailableStartedAtMs = 0;
+        uint32 nodeApproachStartedAtMs = 0;
         uint32 completedLoops = 0;
         size_t routeIndex = 0;
         float lastRouteDistance = std::numeric_limits<float>::max();
@@ -307,6 +309,7 @@ namespace
         bool combatStrategiesSuppressed = false;
         bool passiveNodeGathering = false;
         bool selfbotEnabledByAutofarm = false;
+        bool selfbotMaster = false;
         bool nodeApproachActive = false;
         bool routePointTeleportAttempted = false;
         bool routeExhausted = false;
@@ -924,6 +927,7 @@ namespace
             session->passiveNodeGathering = _config.passiveNodeGathering &&
                 IsMiningOrHerbalismRoute(selectedSources);
             session->selfbotEnabledByAutofarm = selfbotEnabled;
+            session->selfbotMaster = botAI->GetMaster() == bot;
             BuildRoute(*session, std::move(selectedSources));
 
             ApplyActivityOverride(botAI, *session);
@@ -1092,6 +1096,7 @@ namespace
             session->lastSafeLocation = session->returnLocation;
             session->hasLastSafeLocation = true;
             session->selfbotEnabledByAutofarm = selfbotEnabled;
+            session->selfbotMaster = botAI->GetMaster() == bot;
             BuildRoute(*session, std::move(selectedSources));
 
             ApplyActivityOverride(botAI, *session);
@@ -1456,6 +1461,21 @@ namespace
                 StopSession(pending.botGuid, pending.reason, _config.returnOnStop, true);
         }
 
+        void MaintainSessionAfkFlags()
+        {
+            if (!_config.enabled || _sessions.empty())
+                return;
+
+            // Playerbot AI runs while maps update. World scripts run immediately afterward, so this is the final AFK
+            // state for the tick and cannot be immediately replaced by a passive playerbot activity update.
+            for (auto const& [botGuid, session] : _sessions)
+            {
+                (void)session;
+                if (Player* bot = ObjectAccessor::FindConnectedPlayer(botGuid); bot && bot->isAFK())
+                    bot->RemovePlayerFlag(PLAYER_FLAGS_AFK);
+            }
+        }
+
         void OnPlayerLogout(Player* player)
         {
             if (!player)
@@ -1471,6 +1491,20 @@ namespace
 
             for (ObjectGuid const& botGuid : ownedSessions)
                 StopSession(botGuid, "owner logged out", false, false);
+        }
+
+        bool PreventClientAfk(Player* player)
+        {
+            if (!player || !_sessions.contains(player->GetGUID()))
+                return false;
+
+            // A selfbot's connected game client can independently send CHAT_MSG_AFK when it has been idle. Clearing
+            // the resulting player flag after the fact lets the client immediately set it again, so reject that
+            // packet while the farming session owns the bot's activity state.
+            player->RemovePlayerFlag(PLAYER_FLAGS_AFK);
+            if (WorldSession* worldSession = player->GetSession())
+                worldSession->ResetTimeOutTime(true);
+            return true;
         }
 
         void Shutdown()
@@ -1700,9 +1734,11 @@ namespace
             std::unordered_map<uint32, uint8> creatureEntries;
             std::unordered_set<uint32> gameObjectEntries;
             std::unordered_set<uint32> herbalismNodeEntries;
+            std::unordered_set<uint32> miningNodeEntries;
             ItemTemplate const* itemTemplate = sObjectMgr->GetItemTemplate(itemId);
             bool herbalismTarget = itemTemplate && itemTemplate->Class == ITEM_CLASS_TRADE_GOODS &&
                 itemTemplate->SubClass == ITEM_SUBCLASS_HERB;
+            bool miningTarget = false;
 
             if (CreatureTemplateContainer const* creatures = sObjectMgr->GetCreatureTemplates())
             {
@@ -1733,10 +1769,16 @@ namespace
                     if (!LootTemplateContainsItem(loot, itemId))
                         continue;
 
-                    if (GetGameObjectGatheringSkill(&gameObjectTemplate) == SKILL_HERBALISM)
+                    SkillType gatheringSkill = GetGameObjectGatheringSkill(&gameObjectTemplate);
+                    if (gatheringSkill == SKILL_HERBALISM)
                     {
                         herbalismTarget = true;
                         herbalismNodeEntries.insert(entry);
+                    }
+                    else if (gatheringSkill == SKILL_MINING)
+                    {
+                        miningTarget = true;
+                        miningNodeEntries.insert(entry);
                     }
 
                     if (CanUseGameObject(bot, &gameObjectTemplate))
@@ -1747,7 +1789,7 @@ namespace
             std::vector<SourceSpawn> sources;
             sources.reserve(sObjectMgr->GetAllCreatureData().size() / 20 + sObjectMgr->GetAllGOData().size() / 20);
 
-            if (!herbalismTarget)
+            if (!herbalismTarget && !miningTarget)
             {
                 for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
                 {
@@ -1766,7 +1808,8 @@ namespace
             {
                 if (!gameObjectEntries.contains(data.id) || !MapAllowed(_config, data.mapid))
                     continue;
-                if (herbalismTarget && !herbalismNodeEntries.contains(data.id))
+                if ((herbalismTarget && !herbalismNodeEntries.contains(data.id)) ||
+                    (miningTarget && !miningNodeEntries.contains(data.id)))
                     continue;
                 if (!(data.phaseMask & PHASEMASK_NORMAL))
                     continue;
@@ -2004,10 +2047,28 @@ namespace
                     zones[{sources[index].mapId, zoneId}].push_back(index);
             }
 
+            // A node can only be gathered once per respawn cycle, so the total number of known node spawns matters
+            // more than it does for creature routes. Do not let a compact zone with roughly half the node capacity
+            // displace a substantially richer zone; terrain scoring still selects the most practical rich zone.
+            bool nodeRoute = IsMiningOrHerbalismRoute(sources);
+            size_t mostZoneSources = 0;
+            if (nodeRoute)
+            {
+                for (auto const& [zoneKey, zoneIndices] : zones)
+                {
+                    (void)zoneKey;
+                    mostZoneSources = std::max(mostZoneSources, zoneIndices.size());
+                }
+            }
+            size_t minimumNodeZoneSources = mostZoneSources >= 20 ? (mostZoneSources * 3 + 4) / 5 : 0;
+
             ZoneCandidate best;
             bool found = false;
             for (auto const& [zoneKey, zoneIndices] : zones)
             {
+                if (minimumNodeZoneSources && zoneIndices.size() < minimumNodeZoneSources)
+                    continue;
+
                 ZoneCandidate candidate;
                 candidate.key = zoneKey;
                 candidate.possibleSourceCount = zoneIndices.size();
@@ -2367,7 +2428,12 @@ namespace
         {
             Player* bot = botAI->GetBot();
             Player* owner = ObjectAccessor::FindConnectedPlayer(session.ownerGuid);
-            if (!botAI->HasGameClientMaster() && owner)
+            if (session.selfbotMaster)
+            {
+                if (botAI->GetMaster() != bot)
+                    botAI->SetMaster(bot);
+            }
+            else if (!botAI->HasGameClientMaster() && owner)
             {
                 if (Player* originalMaster = botAI->GetMaster())
                     session.originalMasterGuid = originalMaster->GetGUID();
@@ -2452,7 +2518,12 @@ namespace
         void MaintainPlayerOverrides(PlayerbotAI* botAI, FarmSession& session) const
         {
             Player* bot = botAI->GetBot();
-            if (session.activityMasterOverridden)
+            if (session.selfbotMaster)
+            {
+                if (botAI->GetMaster() != bot)
+                    botAI->SetMaster(bot);
+            }
+            else if (session.activityMasterOverridden)
             {
                 if (Player* owner = ObjectAccessor::FindConnectedPlayer(session.ownerGuid))
                     if (botAI->GetMaster() != owner)
@@ -2564,6 +2635,7 @@ namespace
                 return;
 
             session.nodeApproachActive = false;
+            session.nodeApproachStartedAtMs = 0;
             if (session.passiveNodeGathering)
             {
                 SetStrategy(botAI, "travel", BOT_STATE_NON_COMBAT, true);
@@ -2602,6 +2674,7 @@ namespace
                 return;
 
             session.nodeApproachActive = true;
+            session.nodeApproachStartedAtMs = getMSTime();
             SetStrategy(botAI, "travel", BOT_STATE_NON_COMBAT, false);
             SetStrategy(botAI, "mount", BOT_STATE_NON_COMBAT, false);
 
@@ -2873,11 +2946,13 @@ namespace
                 return false;
 
             Player* bot = botAI->GetBot();
-            if (session.nodeApproachActive && bot->isMoving())
+            if (session.nodeApproachActive && bot->isMoving() && session.nodeApproachStartedAtMs &&
+                getMSTimeDiff(session.nodeApproachStartedAtMs, now) < AUTOFARM_NODE_APPROACH_MOVEMENT_GRACE_MS)
             {
                 // A safe navmesh detour can initially increase straight-line distance to the source. Let the current
-                // intermediate waypoint finish instead of interrupting it as stalled and sending the bot back.
-                session.pointStartedAtMs = now;
+                // intermediate waypoint finish instead of interrupting it as stalled and sending the bot back. The
+                // grace period is bounded: movement generators can report moving after a bot has stopped, and that
+                // stale state must not prevent path recovery forever.
                 return false;
             }
 
@@ -3323,6 +3398,7 @@ namespace
 
         void OnUpdate(uint32 diff) override
         {
+            AutofarmMgr::Instance().MaintainSessionAfkFlags();
             AutofarmMgr::Instance().Update(diff);
         }
 
@@ -3335,11 +3411,17 @@ namespace
     class AutofarmPlayerScript final : public PlayerScript
     {
     public:
-        AutofarmPlayerScript() : PlayerScript("AutofarmPlayerScript", {PLAYERHOOK_ON_LOGOUT}) { }
+        AutofarmPlayerScript() : PlayerScript("AutofarmPlayerScript",
+            {PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_CAN_PLAYER_USE_CHAT}) { }
 
         void OnPlayerLogout(Player* player) override
         {
             AutofarmMgr::Instance().OnPlayerLogout(player);
+        }
+
+        bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*language*/, std::string& /*message*/) override
+        {
+            return type != CHAT_MSG_AFK || !AutofarmMgr::Instance().PreventClientAfk(player);
         }
     };
 
