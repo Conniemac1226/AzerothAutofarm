@@ -13,6 +13,7 @@
 #include "DBCStores.h"
 #include "Event.h"
 #include "GameObject.h"
+#include "GameTime.h"
 #include "Log.h"
 #include "LootMgr.h"
 #include "LootObjectStack.h"
@@ -70,6 +71,7 @@ namespace
     constexpr uint32 AUTOFARM_STUCK_TIMEOUT_MS = 8 * IN_MILLISECONDS;
     constexpr uint32 AUTOFARM_NODE_RETRY_MS = 3 * IN_MILLISECONDS;
     constexpr uint32 AUTOFARM_NODE_APPROACH_MOVEMENT_GRACE_MS = 30 * IN_MILLISECONDS;
+    constexpr uint32 AUTOFARM_WATER_BREATHING_SPELL = 131;
     constexpr uint8 AUTOFARM_RETRIES_BEFORE_SKIP = 4;
     constexpr float AUTOFARM_GROUND_APPROACH_RADIUS = 6.0f;
     constexpr size_t AUTOFARM_NEAREST_PATH_CANDIDATES = 16;
@@ -314,6 +316,7 @@ namespace
         bool routePointTeleportAttempted = false;
         bool routeExhausted = false;
         bool activityMasterOverridden = false;
+        bool waterBreathingApplied = false;
         bool npcImmunityApplied = false;
         bool pcImmunityApplied = false;
         ObjectGuid petGuid;
@@ -1461,19 +1464,46 @@ namespace
                 StopSession(pending.botGuid, pending.reason, _config.returnOnStop, true);
         }
 
-        void MaintainSessionAfkFlags()
+        void MaintainSessionSafety()
         {
             if (!_config.enabled || _sessions.empty())
                 return;
 
-            // Playerbot AI runs while maps update. World scripts run immediately afterward, so this is the final AFK
+            // Playerbot AI runs while maps update. World scripts run immediately afterward, so this is the final
             // state for the tick and cannot be immediately replaced by a passive playerbot activity update.
             for (auto const& [botGuid, session] : _sessions)
             {
-                (void)session;
-                if (Player* bot = ObjectAccessor::FindConnectedPlayer(botGuid); bot && bot->isAFK())
+                Player* bot = ObjectAccessor::FindConnectedPlayer(botGuid);
+                if (!bot)
+                    continue;
+
+                if (bot->isAFK())
                     bot->RemovePlayerFlag(PLAYER_FLAGS_AFK);
+
+                // Use the core-supported Water Breathing aura rather than touching its protected mirror-timer API.
+                // This prevents only drowning; fatigue in dark water and lava damage remain untouched.
+                if (bot->IsAlive() && bot->IsUnderWater() && !bot->HasWaterBreathingAura() &&
+                    bot->AddAura(AUTOFARM_WATER_BREATHING_SPELL, bot))
+                    session->waterBreathingApplied = true;
             }
+        }
+
+        void OnPlayerResurrect(Player* player)
+        {
+            if (!player || !_sessions.contains(player->GetGUID()))
+                return;
+
+            // Playerbots' corpse-revival action does not reset fall tracking. Clear it synchronously with the revive
+            // so a stale movement packet cannot turn a stationary resurrection into fatal fall damage.
+            player->GetMotionMaster()->Clear();
+            player->StopMoving();
+            player->RemoveUnitMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
+            player->m_movementInfo.SetFallTime(0);
+            player->SetFallInformation(GameTime::GetGameTime().count(), player->GetPositionZ());
+            if (!player->IsRooted())
+                player->SendMovementFlagUpdate();
+
+            LOG_INFO("module.autofarm", "Autofarm bot {} resurrected; reset stale fall tracking", player->GetName());
         }
 
         void OnPlayerLogout(Player* player)
@@ -2451,7 +2481,7 @@ namespace
             Player* bot = botAI->GetBot();
             if (_config.suppressRestAndBuffs)
             {
-                botAI->InterruptSpell();
+                bot->InterruptNonMeleeSpells(true);
                 if (bot->getStandState() != UNIT_STAND_STATE_STAND)
                     bot->SetStandState(UNIT_STAND_STATE_STAND);
             }
@@ -2589,6 +2619,10 @@ namespace
             }
             session.petNpcImmunityApplied = false;
             session.petPcImmunityApplied = false;
+
+            if (session.waterBreathingApplied)
+                bot->RemoveAurasDueToSpell(AUTOFARM_WATER_BREATHING_SPELL, bot->GetGUID());
+            session.waterBreathingApplied = false;
 
             if (session.npcImmunityApplied)
                 bot->SetImmuneToNPC(false);
@@ -3398,7 +3432,7 @@ namespace
 
         void OnUpdate(uint32 diff) override
         {
-            AutofarmMgr::Instance().MaintainSessionAfkFlags();
+            AutofarmMgr::Instance().MaintainSessionSafety();
             AutofarmMgr::Instance().Update(diff);
         }
 
@@ -3412,11 +3446,16 @@ namespace
     {
     public:
         AutofarmPlayerScript() : PlayerScript("AutofarmPlayerScript",
-            {PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_CAN_PLAYER_USE_CHAT}) { }
+            {PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_PLAYER_RESURRECT, PLAYERHOOK_CAN_PLAYER_USE_CHAT}) { }
 
         void OnPlayerLogout(Player* player) override
         {
             AutofarmMgr::Instance().OnPlayerLogout(player);
+        }
+
+        void OnPlayerResurrect(Player* player, float /*restorePercent*/, bool& /*applySickness*/) override
+        {
+            AutofarmMgr::Instance().OnPlayerResurrect(player);
         }
 
         bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*language*/, std::string& /*message*/) override

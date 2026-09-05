@@ -1,4 +1,4 @@
-AZEROTH AUTOFARM 1.2.1
+AZEROTH AUTOFARM 1.2.3
 ======================
 
 A standalone World of Warcraft 3.3.5a control panel for the AzerothCore
@@ -40,6 +40,9 @@ USAGE
 - The Activity dashboard shows the bot's state, health, bags or reputation,
   location, progress, current source, route position, distance, elapsed time,
   farming rate, and movement-recovery information.
+- When this addon starts a self-farm, it immediately begins clearing the WoW
+  client's idle AFK state, even if the Activity window is closed. It stops
+  doing so if the server rejects the start command or when farming stops.
 
 SLASH COMMANDS
 --------------

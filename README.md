@@ -115,6 +115,8 @@ activities. A normally friendly target must already be attackable, such as by ma
 - Active sessions temporarily force the bot out of playerbots' passive activity rotation, clear the AFK flag, and
   periodically refresh the server activity timeout at no more than half the active socket timeout. Any prior playerbots
   master is restored when farming stops.
+- Active sessions apply Water Breathing only while underwater, so a farming character cannot drown. The aura is
+  removed when farming stops; fatigue in dark water and lava damage are not disabled.
 - Inactive mining/herbalism pool members remain known to the route because they are possible future spawn locations,
   but are skipped before travel until the pool activates them.
 - When normal ground movement and forced path recovery both fail, autofarm may teleport near the source, but only to a

@@ -451,6 +451,10 @@ function AF:StartFarm()
     self.db.botName = botName
     self.db.quantity = tostring(quantity)
     self.db.itemText = itemText
+    self.selfFarmRequested = botName == ""
+    if self.selfFarmRequested then
+        self:ClearSelfAfk()
+    end
     self.statusUnavailable = false
     self:SendCommand(command, "Starting farm route; waiting for the server...")
 end
@@ -473,6 +477,10 @@ function AF:StartReputation()
 
     self.db.botName = botName
     self.db.reputationText = factionText
+    self.selfFarmRequested = botName == ""
+    if self.selfFarmRequested then
+        self:ClearSelfAfk()
+    end
     self.statusUnavailable = false
     self:SendCommand(command, "Starting reputation route; waiting for the server...")
 end
@@ -494,13 +502,34 @@ function AF:StopFarm()
     if botName ~= "" then
         command = command .. " " .. botName
     end
+    if botName == "" then
+        self.selfFarmRequested = nil
+        self.selfFarmActive = false
+    end
     self.statusUnavailable = true
     self:SendCommand(command, "Stopping the selected farming session...")
 end
 
 function AF:StopAll()
+    self.selfFarmRequested = nil
+    self.selfFarmActive = false
     self.statusUnavailable = true
     self:SendCommand(".autofarm stopall", "Stopping all owned farming sessions...")
+end
+
+function AF:ClearSelfAfk()
+    if not (self.selfFarmActive or self.selfFarmRequested) or not UnitIsAFK or not UnitIsAFK("player")
+        or not ToggleAFK then
+        return
+    end
+
+    local now = GetTime()
+    if now < (self.nextAfkClearAt or 0) then
+        return
+    end
+
+    self.nextAfkClearAt = now + 1
+    ToggleAFK()
 end
 
 function AF:SearchServer()
@@ -979,6 +1008,11 @@ function AF:HandleStatusTelemetry(message)
 
     status.receivedAt = GetTime()
     self.activityStatus = status
+    if status.bot == UnitName("player") then
+        self.selfFarmRequested = nil
+        self.selfFarmActive = true
+        self:ClearSelfAfk()
+    end
     self.statusRequestPendingUntil = nil
     self.statusUnavailable = false
     self:RefreshActivityDashboard()
@@ -1834,9 +1868,17 @@ function AF:HandleSystemMessage(message)
     local kind = "info"
     if lower:find("started", 1, true) or lower:find(" is farming [", 1, true) then
         kind = "success"
+        if self.selfFarmRequested then
+            self.selfFarmRequested = nil
+            self.selfFarmActive = true
+            self:ClearSelfAfk()
+        end
         self:SetActivity(message, "success")
     elseif lower:find("stopped", 1, true) then
         kind = "success"
+        if self.selfFarmActive and lower:find((UnitName("player") or ""):lower(), 1, true) then
+            self.selfFarmActive = false
+        end
         self:SetActivity(message, nil)
     elseif lower:find("no ", 1, true)
         or lower:find("does not", 1, true)
@@ -1849,6 +1891,10 @@ function AF:HandleSystemMessage(message)
         or lower:find("only control", 1, true)
     then
         kind = "error"
+        if self.selfFarmRequested then
+            self.selfFarmRequested = nil
+            self.selfFarmActive = false
+        end
         if lower:find("active autofarm session", 1, true)
             or lower:find("online playerbot", 1, true)
             or lower:find("not an online playerbot", 1, true)
@@ -1947,6 +1993,7 @@ function AF:Initialize()
     self:RegisterEvent("CHAT_MSG_SYSTEM")
     self:RegisterEvent("GET_ITEM_INFO_RECEIVED")
     self:RegisterEvent("DISPLAY_SIZE_CHANGED")
+    self:RegisterEvent("PLAYER_FLAGS_CHANGED")
     self:Print("loaded. Type |cffffcc5c/autofarm|r or click the minimap button.")
 end
 
@@ -1964,7 +2011,26 @@ AF:SetScript("OnEvent", function(self, event, ...)
         self:UpdateSelectedItem()
     elseif event == "DISPLAY_SIZE_CHANGED" then
         self:UpdateFrameScales()
+    elseif event == "PLAYER_FLAGS_CHANGED" then
+        local unit = ...
+        if unit == "player" then
+            self:ClearSelfAfk()
+        end
     end
+end)
+
+AF:SetScript("OnUpdate", function(self, elapsed)
+    if not (self.selfFarmActive or self.selfFarmRequested) then
+        return
+    end
+
+    self.afkCheckElapsed = (self.afkCheckElapsed or 0) + elapsed
+    if self.afkCheckElapsed < 1 then
+        return
+    end
+
+    self.afkCheckElapsed = 0
+    self:ClearSelfAfk()
 end)
 
 AF:RegisterEvent("ADDON_LOADED")
