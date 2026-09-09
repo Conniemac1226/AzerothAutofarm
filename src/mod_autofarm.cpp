@@ -29,6 +29,7 @@
 #include "Player.h"
 #include "PlayerScript.h"
 #include "Playerbots.h"
+#include "PlayerbotAIConfig.h"
 #include "PoolMgr.h"
 #include "ReputationMgr.h"
 #include "ScriptMgr.h"
@@ -1398,6 +1399,8 @@ namespace
                     state = "Path recovery";
                 else if (session.waitingForRespawn && distance >= 0.0f && distance <= 35.0f)
                     state = "Waiting for node respawn";
+                else if (bot->IsNonMeleeSpellCast(false) && distance > 35.0f)
+                    state = "Mounting";
                 else if (bot->isMoving())
                     state = distance >= 0.0f && distance <= 35.0f ? "Approaching source" : "Traveling";
 
@@ -2467,6 +2470,61 @@ namespace
             return true;
         }
 
+        static bool IsBotMountedOrForm(Player const* bot)
+        {
+            if (!bot)
+                return false;
+
+            if (bot->IsMounted())
+                return true;
+
+            ShapeshiftForm form = bot->GetShapeshiftForm();
+            return form == FORM_FLIGHT || form == FORM_FLIGHT_EPIC || form == FORM_TRAVEL;
+        }
+
+        static bool EnsureMounted(PlayerbotAI* botAI, float distance)
+        {
+            if (!botAI)
+                return false;
+
+            Player* bot = botAI->GetBot();
+            if (!bot || !bot->IsAlive() || bot->IsInCombat() || !bot->IsOutdoors())
+                return false;
+
+            if (IsBotMountedOrForm(bot))
+                return true;
+
+            if (bot->GetLevel() < sPlayerbotAIConfig.useGroundMountAtMinLevel)
+                return false;
+
+            if (distance <= 35.0f)
+                return false;
+
+            // If the bot is already casting a mount spell, stay stopped and let the cast finish
+            if (bot->IsNonMeleeSpellCast(false))
+            {
+                if (bot->isMoving())
+                    bot->StopMoving();
+                return true;
+            }
+
+            // Halt movement cleanly before triggering the mount action
+            if (bot->isMoving())
+            {
+                bot->GetMotionMaster()->Clear();
+                bot->StopMoving();
+                botAI->GetAiObjectContext()->GetValue<LastMovement&>("last movement")->Get().clear();
+            }
+
+            if (botAI->DoSpecificAction("check mount state", Event(), true))
+            {
+                if (bot->IsNonMeleeSpellCast(false) || IsBotMountedOrForm(bot))
+                    return true;
+            }
+
+            return false;
+        }
+
         bool IsFlightTravelReady(Player* bot) const
         {
             if (!_config.useFlyingMounts || (bot->GetMapId() != 530 && bot->GetMapId() != 571))
@@ -2602,20 +2660,19 @@ namespace
         static void ApplyActivityOverride(PlayerbotAI* botAI, FarmSession& session)
         {
             Player* bot = botAI->GetBot();
-            Player* owner = ObjectAccessor::FindConnectedPlayer(session.ownerGuid);
-            if (session.selfbotMaster)
+            if (Player* originalMaster = botAI->GetMaster())
             {
-                if (botAI->GetMaster() != bot)
-                    botAI->SetMaster(bot);
-            }
-            else if (!botAI->HasGameClientMaster() && owner)
-            {
-                if (Player* originalMaster = botAI->GetMaster())
+                if (originalMaster != bot)
+                {
                     session.originalMasterGuid = originalMaster->GetGUID();
-
-                botAI->SetMaster(owner);
-                session.activityMasterOverridden = true;
+                    session.activityMasterOverridden = true;
+                }
             }
+
+            // Treat the bot as its own master during autofarm so playerbots' mount logic
+            // does not follow an idle owner's mount state (or dismount when the owner is on foot).
+            if (botAI->GetMaster() != bot)
+                botAI->SetMaster(bot);
 
             botAI->AllowActivity(ALL_ACTIVITY, true);
             bot->RemovePlayerFlag(PLAYER_FLAGS_AFK);
@@ -2693,17 +2750,8 @@ namespace
         void MaintainPlayerOverrides(PlayerbotAI* botAI, FarmSession& session) const
         {
             Player* bot = botAI->GetBot();
-            if (session.selfbotMaster)
-            {
-                if (botAI->GetMaster() != bot)
-                    botAI->SetMaster(bot);
-            }
-            else if (session.activityMasterOverridden)
-            {
-                if (Player* owner = ObjectAccessor::FindConnectedPlayer(session.ownerGuid))
-                    if (botAI->GetMaster() != owner)
-                        botAI->SetMaster(owner);
-            }
+            if (botAI->GetMaster() != bot)
+                botAI->SetMaster(bot);
 
             // Playerbots marks bots AFK whenever its activity rotation makes them passive. Autofarm sessions must stay
             // active regardless of that rotation, so refresh the cached decision before clearing the flag.
@@ -2847,6 +2895,11 @@ namespace
                     botAI->GetBot()->GetName(), session.routeIndex + 1, session.route.size(), point.source.mapId,
                     point.source.x, point.source.y, point.source.z, point.source.entry, point.source.spawnId);
             }
+
+            Player* bot = botAI->GetBot();
+            float distance = bot ? bot->GetExactDist(point.source.x, point.source.y, point.source.z) : 0.0f;
+            if (distance > 35.0f)
+                EnsureMounted(botAI, distance);
         }
 
         static void BeginNodeApproach(PlayerbotAI* botAI, FarmSession& session)
@@ -3399,6 +3452,12 @@ namespace
             }
 
             float distance = bot->GetExactDist(point.source.x, point.source.y, point.source.z);
+            if (distance > 35.0f && !bot->IsInCombat())
+            {
+                if (EnsureMounted(botAI, distance) && bot->IsNonMeleeSpellCast(false))
+                    return std::nullopt;
+            }
+
             if (IsFlightTravelReady(bot))
             {
                 if (UpdateFlightTravel(botAI, session, point, now))
