@@ -17,6 +17,7 @@
 #include "Log.h"
 #include "LootMgr.h"
 #include "LootObjectStack.h"
+#include "LootStrategyValue.h"
 #include "LootValues.h"
 #include "Map.h"
 #include "MapMgr.h"
@@ -359,6 +360,8 @@ namespace
         bool routeExhausted = false;
         bool waitingForRespawn = false;
         bool activityMasterOverridden = false;
+        bool lootStrategyOverridden = false;
+        std::string originalLootStrategy;
         bool waterBreathingApplied = false;
         bool npcImmunityApplied = false;
         bool pcImmunityApplied = false;
@@ -2482,6 +2485,19 @@ namespace
             return form == FORM_FLIGHT || form == FORM_FLIGHT_EPIC || form == FORM_TRAVEL;
         }
 
+        static void DismountOrCancelTravelForm(Player* bot)
+        {
+            if (!bot)
+                return;
+
+            if (bot->IsMounted())
+                bot->Dismount();
+
+            ShapeshiftForm form = bot->GetShapeshiftForm();
+            if (form == FORM_FLIGHT || form == FORM_FLIGHT_EPIC || form == FORM_TRAVEL)
+                bot->RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);
+        }
+
         static bool EnsureMounted(PlayerbotAI* botAI, float distance)
         {
             if (!botAI)
@@ -2654,6 +2670,32 @@ namespace
                     ->GetValue<std::set<uint32>&>("always loot list")->Get();
                 session.itemWasAlwaysLooted = alwaysLoot.contains(session.itemId);
                 alwaysLoot.insert(session.itemId);
+            }
+
+            bool hasCreatureFarming = false;
+            for (RoutePoint const& point : session.route)
+            {
+                if (point.source.sourceMask & (SOURCE_CREATURE_LOOT | SOURCE_CREATURE_SKIN))
+                {
+                    hasCreatureFarming = true;
+                    break;
+                }
+            }
+
+            if (hasCreatureFarming)
+            {
+                if (auto* lootStrategyValue = botAI->GetAiObjectContext()->GetValue<LootStrategy*>("loot strategy"))
+                {
+                    if (LootStrategy* current = lootStrategyValue->Get())
+                    {
+                        session.originalLootStrategy = current->GetName();
+                        if (session.originalLootStrategy != "all")
+                        {
+                            lootStrategyValue->Set(LootStrategyValue::instance("all"));
+                            session.lootStrategyOverridden = true;
+                        }
+                    }
+                }
             }
         }
 
@@ -2855,6 +2897,14 @@ namespace
                 auto& alwaysLoot = botAI->GetAiObjectContext()
                     ->GetValue<std::set<uint32>&>("always loot list")->Get();
                 alwaysLoot.erase(session.itemId);
+            }
+
+            if (session.lootStrategyOverridden && !session.originalLootStrategy.empty())
+            {
+                if (auto* lootStrategyValue = botAI->GetAiObjectContext()->GetValue<LootStrategy*>("loot strategy"))
+                    lootStrategyValue->Set(LootStrategyValue::instance(session.originalLootStrategy));
+                session.lootStrategyOverridden = false;
+                session.originalLootStrategy.clear();
             }
         }
 
@@ -3451,14 +3501,22 @@ namespace
                 return std::nullopt;
             }
 
-            float distance = bot->GetExactDist(point.source.x, point.source.y, point.source.z);
-            if (distance > 35.0f && !bot->IsInCombat())
+            Creature* creature = nullptr;
+            if (!(point.source.sourceMask & SOURCE_GAMEOBJECT))
+                creature = ObjectAccessor::GetSpawnedCreatureByDBGUID(point.source.mapId, point.source.spawnId);
+
+            float distance = (creature && creature->IsInWorld()) ?
+                bot->GetDistance(creature) :
+                bot->GetExactDist(point.source.x, point.source.y, point.source.z);
+
+            bool isDeadCorpseAwaitingLoot = creature && creature->IsInWorld() && !creature->IsAlive();
+            if (distance > 35.0f && !bot->IsInCombat() && !isDeadCorpseAwaitingLoot)
             {
                 if (EnsureMounted(botAI, distance) && bot->IsNonMeleeSpellCast(false))
                     return std::nullopt;
             }
 
-            if (IsFlightTravelReady(bot))
+            if (IsFlightTravelReady(bot) && !isDeadCorpseAwaitingLoot)
             {
                 if (UpdateFlightTravel(botAI, session, point, now))
                     return std::nullopt;
@@ -3474,13 +3532,13 @@ namespace
             if (session.passiveNodeGathering && gameObjectPoint && distance <= 35.0f)
                 BeginNodeApproach(botAI, session);
 
-            bool needsRouteProgress = distance > 35.0f ||
+            bool needsRouteProgress = (distance > 35.0f && !isDeadCorpseAwaitingLoot) ||
                 (gameObjectPoint && distance > AUTOFARM_INTERACTION_DISTANCE);
             if (needsRouteProgress && RecoverStalledRoute(botAI, session, point, distance, now))
                 return std::nullopt;
 
             TravelTarget* travelTarget = botAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
-            if (distance > 35.0f)
+            if (distance > 35.0f && !isDeadCorpseAwaitingLoot)
             {
                 if (!travelTarget || !travelTarget->isTraveling())
                 {
@@ -3600,8 +3658,8 @@ namespace
                 return;
             }
 
-            bool professionGatheringSource = point.source.sourceMask & SOURCE_CREATURE_SKIN;
-            if (professionGatheringSource && bot->GetDistance(creature) > AUTOFARM_INTERACTION_DISTANCE)
+            bool creatureLootSource = point.source.sourceMask & (SOURCE_CREATURE_LOOT | SOURCE_CREATURE_SKIN);
+            if (creatureLootSource && bot->GetDistance(creature) > AUTOFARM_INTERACTION_DISTANCE)
             {
                 session.interactionStartedAtMs = 0;
                 session.sourceUnavailableStartedAtMs = 0;
@@ -3610,10 +3668,13 @@ namespace
                 return;
             }
 
+            DismountOrCancelTravelForm(bot);
+
             LootObject loot(bot, creature->GetGUID());
             // LootObject's normal permission check exempts classic Skinning after corpse loot is exhausted, but not
             // the other creature-gathering professions. Validate that ready state here without weakening the skill,
             // required-item, or profession-tool checks.
+            bool professionGatheringSource = point.source.sourceMask & SOURCE_CREATURE_SKIN;
             bool professionGatheringReady = IsProfessionGatheringReady(bot, creature, loot);
             if (loot.IsEmpty() || (!loot.IsLootPossible(bot) && !professionGatheringReady))
             {
@@ -3636,29 +3697,20 @@ namespace
             session.sourceUnavailableStartedAtMs = 0;
 
             uint32 now = getMSTime();
-            bool interactionJustStarted = false;
             if (!session.interactionStartedAtMs)
             {
                 session.interactionStartedAtMs = now;
-                interactionJustStarted = true;
-            }
-
-            if (professionGatheringSource)
-            {
-                // Opening ordinary corpse loot removes it from playerbots' available-loot stack. Re-add and
-                // refresh the target on every stage so the subsequent profession cast is not lost.
-                botAI->GetAiObjectContext()->GetValue<LootObjectStack*>("available loot")->Get()
-                    ->Add(creature->GetGUID());
-                botAI->GetAiObjectContext()->GetValue<LootObject>("loot target")->Set(loot);
-                if (!bot->IsNonMeleeSpellCast(false))
-                    botAI->DoSpecificAction("open loot", Event(), true);
-            }
-            else if (interactionJustStarted)
-            {
-                botAI->GetAiObjectContext()->GetValue<LootObjectStack*>("available loot")->Get()
-                    ->Add(creature->GetGUID());
                 botAI->DoSpecificAction("add all loot", Event(), true);
             }
+
+            // Opening ordinary corpse loot removes it from playerbots' available-loot stack. Re-add and
+            // refresh the target on every stage so the subsequent profession cast or loot opening is not lost.
+            botAI->GetAiObjectContext()->GetValue<LootObjectStack*>("available loot")->Get()
+                ->Add(creature->GetGUID());
+            botAI->GetAiObjectContext()->GetValue<LootObject>("loot target")->Set(loot);
+
+            if (!bot->IsNonMeleeSpellCast(false))
+                botAI->DoSpecificAction("open loot", Event(), true);
 
             if (getMSTimeDiff(session.interactionStartedAtMs, now) > _config.interactionTimeoutMs)
                 AdvanceRoute(botAI, session);
