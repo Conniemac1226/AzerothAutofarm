@@ -132,15 +132,56 @@ namespace
     bool IsSourceSpawnActive(SourceSpawn const& source)
     {
         Map const* map = sMapMgr->CreateBaseMap(source.mapId);
+        if (!map)
+            return false;
+
+        time_t now = GameTime::GetGameTime().count();
 
         if (source.sourceMask & SOURCE_GAMEOBJECT)
         {
-            return !sPoolMgr->IsPartOfAPool<GameObject>(source.spawnId) ||
-                map->GetPoolData().IsSpawnedObject<GameObject>(source.spawnId);
+            if (sPoolMgr->IsPartOfAPool<GameObject>(source.spawnId) &&
+                !map->GetPoolData().IsSpawnedObject<GameObject>(source.spawnId))
+                return false;
+
+            time_t respawnTime = map->GetGORespawnTime(source.spawnId);
+            if (respawnTime && respawnTime > now)
+                return false;
+
+            if (GameObject* go = ObjectAccessor::GetSpawnedGameObjectByDBGUID(source.mapId, source.spawnId))
+                if (!go->isSpawned() || go->GetGoState() != GO_STATE_READY)
+                    return false;
+
+            return true;
         }
 
-        return !sPoolMgr->IsPartOfAPool<Creature>(source.spawnId) ||
-            map->GetPoolData().IsSpawnedObject<Creature>(source.spawnId);
+        if (sPoolMgr->IsPartOfAPool<Creature>(source.spawnId) &&
+            !map->GetPoolData().IsSpawnedObject<Creature>(source.spawnId))
+            return false;
+
+        time_t respawnTime = map->GetCreatureRespawnTime(source.spawnId);
+        if (respawnTime && respawnTime > now)
+            return false;
+
+        if (Creature* creature = ObjectAccessor::GetSpawnedCreatureByDBGUID(source.mapId, source.spawnId))
+            if (!creature->IsAlive())
+                return false;
+
+        return true;
+    }
+
+    time_t GetSourceRespawnTime(SourceSpawn const& source)
+    {
+        Map const* map = sMapMgr->CreateBaseMap(source.mapId);
+        if (!map)
+            return 0;
+
+        if (source.sourceMask & SOURCE_GAMEOBJECT)
+            return map->GetGORespawnTime(source.spawnId);
+
+        if (source.sourceMask & (SOURCE_CREATURE_LOOT | SOURCE_CREATURE_SKIN))
+            return map->GetCreatureRespawnTime(source.spawnId);
+
+        return 0;
     }
 
     class AutofarmDestination final : public TravelDestination
@@ -315,6 +356,7 @@ namespace
         bool nodeApproachActive = false;
         bool routePointTeleportAttempted = false;
         bool routeExhausted = false;
+        bool waitingForRespawn = false;
         bool activityMasterOverridden = false;
         bool waterBreathingApplied = false;
         bool npcImmunityApplied = false;
@@ -530,6 +572,33 @@ namespace
         return mapEntry && !mapEntry->Instanceable();
     }
 
+    bool HasCreatureGatheringTool(Player const* bot, SkillType skill)
+    {
+        if (!bot)
+            return false;
+
+        auto hasAnyItem = [bot](auto const& itemIds)
+        {
+            return std::any_of(itemIds.begin(), itemIds.end(),
+                [bot](uint32 itemId) { return bot->HasItemCount(itemId, 1); });
+        };
+
+        if (skill == SKILL_MINING)
+        {
+            static constexpr std::array<uint32, 11> miningTools =
+                {756, 778, 1819, 1893, 1959, 2901, 9465, 20723, 40772, 40892, 40893};
+            return hasAnyItem(miningTools);
+        }
+
+        if (skill == SKILL_SKINNING)
+        {
+            static constexpr std::array<uint32, 5> skinningTools = {7005, 40772, 40893, 12709, 19901};
+            return hasAnyItem(skinningTools);
+        }
+
+        return true;
+    }
+
     bool CanUseGameObject(Player const* bot, GameObjectTemplate const* gameObjectTemplate)
     {
         if (!bot || !gameObjectTemplate)
@@ -555,7 +624,12 @@ namespace
 
             hasSkillRequirement = true;
             if (bot->HasSkill(skill) && bot->GetSkillValue(skill) >= std::max<uint32>(1, lock->Skill[index]))
+            {
+                if (skill == SKILL_MINING && !HasCreatureGatheringTool(bot, SKILL_MINING))
+                    return false;
+
                 return true;
+            }
         }
 
         return !hasSkillRequirement;
@@ -616,6 +690,21 @@ namespace
         });
     }
 
+    bool IsMiningRoute(std::vector<SourceSpawn> const& sources)
+    {
+        if (sources.empty())
+            return false;
+
+        return std::all_of(sources.begin(), sources.end(), [](SourceSpawn const& source)
+        {
+            if (!(source.sourceMask & SOURCE_GAMEOBJECT))
+                return false;
+
+            GameObjectTemplate const* gameObjectTemplate = sObjectMgr->GetGameObjectTemplate(source.entry);
+            return GetGameObjectGatheringSkill(gameObjectTemplate) == SKILL_MINING;
+        });
+    }
+
     bool CanSkinCreature(Player const* bot, CreatureTemplate const* creatureTemplate)
     {
         if (!bot || !creatureTemplate || !creatureTemplate->SkinLootId)
@@ -628,33 +717,6 @@ namespace
         uint32 level = creatureTemplate->maxlevel;
         uint32 requiredSkill = level < 10 ? 1 : level < 20 ? (level - 10) * 10 : level * 5;
         return bot->GetSkillValue(skill) >= requiredSkill;
-    }
-
-    bool HasCreatureGatheringTool(Player const* bot, SkillType skill)
-    {
-        if (!bot)
-            return false;
-
-        auto hasAnyItem = [bot](auto const& itemIds)
-        {
-            return std::any_of(itemIds.begin(), itemIds.end(),
-                [bot](uint32 itemId) { return bot->HasItemCount(itemId, 1); });
-        };
-
-        if (skill == SKILL_MINING)
-        {
-            static constexpr std::array<uint32, 11> miningTools =
-                {756, 778, 1819, 1893, 1959, 2901, 9465, 20723, 40772, 40892, 40893};
-            return hasAnyItem(miningTools);
-        }
-
-        if (skill == SKILL_SKINNING)
-        {
-            static constexpr std::array<uint32, 5> skinningTools = {7005, 40772, 40893, 12709, 19901};
-            return hasAnyItem(skinningTools);
-        }
-
-        return true;
     }
 
     bool IsProfessionGatheringReady(Player const* bot, Creature const* creature, LootObject& loot)
@@ -692,15 +754,21 @@ namespace
 
         static std::vector<Anchor> const allianceAnchors =
         {
-            {0, -8833.0f, 628.0f},
-            {1, 9951.0f, 2280.0f},
-            {1, -3965.0f, -11653.0f}
+            {0, -8833.0f, 628.0f},       // Stormwind City
+            {0, -4918.0f, -940.0f},      // Ironforge
+            {1, 9951.0f, 2280.0f},       // Darnassus
+            {530, -3965.0f, -11653.0f},  // The Exodar
+            {530, -1863.0f, 5414.0f},    // Shattrath City
+            {571, 5804.0f, 624.0f}       // Dalaran
         };
         static std::vector<Anchor> const hordeAnchors =
         {
-            {0, 1586.0f, 239.0f},
-            {0, 9484.0f, -7279.0f},
-            {1, 1500.0f, -4415.0f}
+            {0, 1586.0f, 239.0f},        // Undercity
+            {1, 1500.0f, -4415.0f},      // Orgrimmar
+            {1, -1280.0f, 130.0f},       // Thunder Bluff
+            {530, 9484.0f, -7279.0f},    // Silvermoon City
+            {530, -1863.0f, 5414.0f},    // Shattrath City
+            {571, 5804.0f, 624.0f}       // Dalaran
         };
 
         std::vector<Anchor> const& anchors = bot->GetTeamId() == TEAM_ALLIANCE ? allianceAnchors : hordeAnchors;
@@ -873,6 +941,14 @@ namespace
             std::vector<SourceSpawn> sources = FindSources(bot, itemTemplate->ItemId);
             if (sources.empty())
             {
+                bool isMiningItem = (itemTemplate->Class == ITEM_CLASS_TRADE_GOODS &&
+                    itemTemplate->SubClass == ITEM_SUBCLASS_METAL_STONE);
+                if (isMiningItem && !HasCreatureGatheringTool(bot, SKILL_MINING))
+                {
+                    handler->SendErrorMessage("The playerbot requires a Mining Pick in inventory to mine mineral veins.");
+                    return false;
+                }
+
                 handler->SendErrorMessage(
                     "No usable outdoor source was found for [{}] ({}). The item may be crafted, sold, open-water "
                     "fished, container-only, profession-locked, or above this bot's safe creature level.",
@@ -888,22 +964,32 @@ namespace
                 return false;
             }
 
+            if (IsHerbalismRoute(selectedSources) || IsMiningRoute(selectedSources))
+                selectedSources = ExpandGatheringRoute(bot, std::move(selectedSources));
+
             auto firstActiveSource = std::find_if(selectedSources.begin(), selectedSources.end(),
                 [](SourceSpawn const& source) { return IsSourceSpawnActive(source); });
-            if (firstActiveSource == selectedSources.end())
+            if (firstActiveSource != selectedSources.end())
+                std::rotate(selectedSources.begin(), firstActiveSource, selectedSources.end());
+            else
             {
-                handler->SendErrorMessage("No source spawn for [{}] is currently active in the selected zone.",
-                    itemTemplate->Name1);
-                return false;
-            }
+                time_t now = GameTime::GetGameTime().count();
+                time_t soonestTime = std::numeric_limits<time_t>::max();
+                auto soonestSource = selectedSources.end();
 
-            if (IsHerbalismRoute(selectedSources))
-            {
-                selectedSources = ExpandHerbalismRoute(bot, std::move(selectedSources));
-                firstActiveSource = std::find_if(selectedSources.begin(), selectedSources.end(),
-                    [](SourceSpawn const& source) { return IsSourceSpawnActive(source); });
+                for (auto it = selectedSources.begin(); it != selectedSources.end(); ++it)
+                {
+                    time_t respawnTime = GetSourceRespawnTime(*it);
+                    if (respawnTime > now && respawnTime < soonestTime)
+                    {
+                        soonestTime = respawnTime;
+                        soonestSource = it;
+                    }
+                }
+
+                if (soonestSource != selectedSources.end())
+                    std::rotate(selectedSources.begin(), soonestSource, selectedSources.end());
             }
-            std::rotate(selectedSources.begin(), firstActiveSource, selectedSources.end());
 
             bool selfbotEnabled = false;
             if (needsSelfbot)
@@ -1066,13 +1152,27 @@ namespace
             }
             auto firstActiveSource = std::find_if(selectedSources.begin(), selectedSources.end(),
                 [](SourceSpawn const& source) { return IsSourceSpawnActive(source); });
-            if (firstActiveSource == selectedSources.end())
+            if (firstActiveSource != selectedSources.end())
+                std::rotate(selectedSources.begin(), firstActiveSource, selectedSources.end());
+            else
             {
-                handler->PSendSysMessage("No {} reputation target is currently active in the selected zone.",
-                    faction->name[0]);
-                return false;
+                time_t now = GameTime::GetGameTime().count();
+                time_t soonestTime = std::numeric_limits<time_t>::max();
+                auto soonestSource = selectedSources.end();
+
+                for (auto it = selectedSources.begin(); it != selectedSources.end(); ++it)
+                {
+                    time_t respawnTime = GetSourceRespawnTime(*it);
+                    if (respawnTime > now && respawnTime < soonestTime)
+                    {
+                        soonestTime = respawnTime;
+                        soonestSource = it;
+                    }
+                }
+
+                if (soonestSource != selectedSources.end())
+                    std::rotate(selectedSources.begin(), soonestSource, selectedSources.end());
             }
-            std::rotate(selectedSources.begin(), firstActiveSource, selectedSources.end());
 
             bool selfbotEnabled = false;
             if (needsSelfbot)
@@ -1296,6 +1396,8 @@ namespace
                     state = point.source.sourceMask & SOURCE_GAMEOBJECT ? "Gathering" : "Looting";
                 else if (session.stuckRecoveryAttempts)
                     state = "Path recovery";
+                else if (session.waitingForRespawn && distance >= 0.0f && distance <= 35.0f)
+                    state = "Waiting for node respawn";
                 else if (bot->isMoving())
                     state = distance >= 0.0f && distance <= 35.0f ? "Approaching source" : "Traveling";
 
@@ -1768,27 +1870,8 @@ namespace
             ItemTemplate const* itemTemplate = sObjectMgr->GetItemTemplate(itemId);
             bool herbalismTarget = itemTemplate && itemTemplate->Class == ITEM_CLASS_TRADE_GOODS &&
                 itemTemplate->SubClass == ITEM_SUBCLASS_HERB;
-            bool miningTarget = false;
-
-            if (CreatureTemplateContainer const* creatures = sObjectMgr->GetCreatureTemplates())
-            {
-                for (auto const& [entry, creatureTemplate] : *creatures)
-                {
-                    if (creatureTemplate.rank > CREATURE_ELITE_NORMAL)
-                        continue;
-                    if (creatureTemplate.maxlevel > bot->GetLevel() + _config.maxCreatureLevelsAboveBot)
-                        continue;
-
-                    ObjectGuid guid = ObjectGuid::Create<HighGuid::Unit>(entry, uint32(1));
-                    LootTemplateAccess const* corpseLoot = DropMapValue::GetLootTemplate(guid, LOOT_CORPSE);
-                    if (LootTemplateContainsItem(corpseLoot, itemId))
-                        creatureEntries[entry] |= SOURCE_CREATURE_LOOT;
-
-                    LootTemplateAccess const* skinLoot = DropMapValue::GetLootTemplate(guid, LOOT_SKINNING);
-                    if (LootTemplateContainsItem(skinLoot, itemId) && CanSkinCreature(bot, &creatureTemplate))
-                        creatureEntries[entry] |= SOURCE_CREATURE_SKIN;
-                }
-            }
+            bool miningTarget = itemTemplate && itemTemplate->Class == ITEM_CLASS_TRADE_GOODS &&
+                itemTemplate->SubClass == ITEM_SUBCLASS_METAL_STONE;
 
             if (GameObjectTemplateContainer const* gameObjects = sObjectMgr->GetGameObjectTemplates())
             {
@@ -1813,6 +1896,29 @@ namespace
 
                     if (CanUseGameObject(bot, &gameObjectTemplate))
                         gameObjectEntries.insert(entry);
+                }
+            }
+
+            if (!herbalismTarget && !miningTarget)
+            {
+                if (CreatureTemplateContainer const* creatures = sObjectMgr->GetCreatureTemplates())
+                {
+                    for (auto const& [entry, creatureTemplate] : *creatures)
+                    {
+                        if (creatureTemplate.rank > CREATURE_ELITE_NORMAL)
+                            continue;
+                        if (creatureTemplate.maxlevel > bot->GetLevel() + _config.maxCreatureLevelsAboveBot)
+                            continue;
+
+                        ObjectGuid guid = ObjectGuid::Create<HighGuid::Unit>(entry, uint32(1));
+                        LootTemplateAccess const* corpseLoot = DropMapValue::GetLootTemplate(guid, LOOT_CORPSE);
+                        if (LootTemplateContainsItem(corpseLoot, itemId))
+                            creatureEntries[entry] |= SOURCE_CREATURE_LOOT;
+
+                        LootTemplateAccess const* skinLoot = DropMapValue::GetLootTemplate(guid, LOOT_SKINNING);
+                        if (LootTemplateContainsItem(skinLoot, itemId) && CanSkinCreature(bot, &creatureTemplate))
+                            creatureEntries[entry] |= SOURCE_CREATURE_SKIN;
+                    }
                 }
             }
 
@@ -1945,10 +2051,14 @@ namespace
 
             auto distance = [](SourceSpawn const& left, SourceSpawn const& right)
             {
-                return std::sqrt(SquaredDistance(left.x, left.y, right.x, right.y));
+                float dx = left.x - right.x;
+                float dy = left.y - right.y;
+                float dz = (left.z - right.z) * 2.0f;
+                return std::sqrt(dx * dx + dy * dy + dz * dz);
             };
 
-            for (uint8 pass = 0; pass < 4; ++pass)
+            constexpr uint8 maxPasses = 25;
+            for (uint8 pass = 0; pass < maxPasses; ++pass)
             {
                 bool improved = false;
                 for (size_t first = 0; first + 2 < ordered.size(); ++first)
@@ -1964,7 +2074,7 @@ namespace
                             distance(ordered[second], ordered[secondNext]);
                         double swappedDistance = distance(ordered[first], ordered[second]) +
                             distance(ordered[firstNext], ordered[secondNext]);
-                        if (swappedDistance + 1.0 >= currentDistance)
+                        if (swappedDistance >= currentDistance - 0.01)
                             continue;
 
                         std::reverse(ordered.begin() + firstNext, ordered.begin() + second + 1);
@@ -1979,9 +2089,18 @@ namespace
             return ordered;
         }
 
-        std::vector<SourceSpawn> ExpandHerbalismRoute(Player* bot, std::vector<SourceSpawn> selectedSources) const
+        std::vector<SourceSpawn> ExpandGatheringRoute(Player* bot, std::vector<SourceSpawn> selectedSources) const
         {
             if (!bot || selectedSources.empty() || selectedSources.size() >= _config.maxRoutePoints)
+                return selectedSources;
+
+            SkillType targetSkill = SKILL_NONE;
+            if (IsHerbalismRoute(selectedSources))
+                targetSkill = SKILL_HERBALISM;
+            else if (IsMiningRoute(selectedSources))
+                targetSkill = SKILL_MINING;
+
+            if (targetSkill == SKILL_NONE)
                 return selectedSources;
 
             uint32 mapId = selectedSources.front().mapId;
@@ -2008,7 +2127,7 @@ namespace
                     continue;
 
                 GameObjectTemplate const* gameObjectTemplate = sObjectMgr->GetGameObjectTemplate(data.id);
-                if (GetGameObjectGatheringSkill(gameObjectTemplate) != SKILL_HERBALISM ||
+                if (GetGameObjectGatheringSkill(gameObjectTemplate) != targetSkill ||
                     !CanUseGameObject(bot, gameObjectTemplate))
                     continue;
 
@@ -2053,6 +2172,11 @@ namespace
             return OrderZoneRoute(selectedSources, indices, centerX, centerY);
         }
 
+        std::vector<SourceSpawn> ExpandHerbalismRoute(Player* bot, std::vector<SourceSpawn> selectedSources) const
+        {
+            return ExpandGatheringRoute(bot, std::move(selectedSources));
+        }
+
         std::vector<SourceSpawn> SelectZone(Player* bot, std::vector<SourceSpawn> const& sources) const
         {
             struct ZoneCandidate
@@ -2090,7 +2214,8 @@ namespace
                     mostZoneSources = std::max(mostZoneSources, zoneIndices.size());
                 }
             }
-            size_t minimumNodeZoneSources = mostZoneSources >= 20 ? (mostZoneSources * 3 + 4) / 5 : 0;
+            size_t mostEffectiveSources = std::min(mostZoneSources, static_cast<size_t>(_config.maxRoutePoints));
+            size_t minimumNodeZoneSources = mostEffectiveSources >= 20 ? (mostEffectiveSources + 1) / 2 : 0;
 
             ZoneCandidate best;
             bool found = false;
@@ -2115,6 +2240,26 @@ namespace
 
                 if (candidate.indices.empty())
                     continue;
+
+                AreaTableEntry const* zoneEntry = sAreaTableStore.LookupEntry(candidate.key.zoneId);
+                bool isEnemyTerritory = false;
+                if (zoneEntry)
+                {
+                    TeamId botTeam = bot->GetTeamId(true);
+                    if ((botTeam == TEAM_ALLIANCE && zoneEntry->team == AREATEAM_HORDE) ||
+                        (botTeam == TEAM_HORDE && zoneEntry->team == AREATEAM_ALLY))
+                    {
+                        isEnemyTerritory = true;
+                    }
+                }
+
+                double levelPenalty = 0.0;
+                if (zoneEntry && zoneEntry->area_level > 0)
+                {
+                    int32 levelDiff = zoneEntry->area_level - static_cast<int32>(bot->GetLevel());
+                    if (levelDiff > static_cast<int32>(_config.maxCreatureLevelsAboveBot))
+                        levelPenalty = static_cast<double>(levelDiff) * 25.0;
+                }
 
                 double nearestDistanceSum = 0.0;
                 double nearestGradeSum = 0.0;
@@ -2157,8 +2302,8 @@ namespace
                     std::max(0.0f, candidate.coverageRadius - _config.clusterSize) * 0.02;
                 double productivity = static_cast<double>(candidate.possibleSourceCount) * 1000.0 / navigationCost;
                 double anchorPenalty = FactionAnchorDistance(bot, zoneKey.mapId, candidate.centerX,
-                    candidate.centerY) / 10000.0;
-                candidate.score = productivity - anchorPenalty;
+                    candidate.centerY) / 500.0;
+                candidate.score = productivity - anchorPenalty - levelPenalty - (isEnemyTerritory ? 2000.0 : 0.0);
 
                 if (!found || candidate.score > best.score)
                 {
@@ -2607,6 +2752,8 @@ namespace
             if (!bot)
                 return;
 
+            ClearActiveFlight(bot);
+
             if (!session.petGuid.IsEmpty())
             {
                 if (Pet* pet = ObjectAccessor::GetPet(*bot, session.petGuid))
@@ -2907,19 +3054,61 @@ namespace
             }
 
             size_t checked = 0;
+            bool foundActive = false;
+            size_t nextIndex = session.routeIndex;
             while (checked < session.route.size())
             {
-                ++session.routeIndex;
-                if (session.routeIndex >= session.route.size())
+                ++nextIndex;
+                if (nextIndex >= session.route.size())
                 {
-                    session.routeIndex = 0;
+                    nextIndex = 0;
                     ++session.completedLoops;
                 }
 
                 ++checked;
-                if (!session.unreachableRoutePoints.contains(session.routeIndex) &&
-                    IsSourceSpawnActive(session.route[session.routeIndex].source))
+                if (!session.unreachableRoutePoints.contains(nextIndex) &&
+                    IsSourceSpawnActive(session.route[nextIndex].source))
+                {
+                    foundActive = true;
+                    session.routeIndex = nextIndex;
+                    session.waitingForRespawn = false;
                     break;
+                }
+            }
+
+            if (!foundActive)
+            {
+                time_t now = GameTime::GetGameTime().count();
+                time_t soonestTime = std::numeric_limits<time_t>::max();
+                size_t soonestIndex = session.routeIndex;
+                bool foundSoonest = false;
+
+                for (size_t index = 0; index < session.route.size(); ++index)
+                {
+                    if (session.unreachableRoutePoints.contains(index))
+                        continue;
+
+                    time_t respawnTime = GetSourceRespawnTime(session.route[index].source);
+                    if (respawnTime > now && respawnTime < soonestTime)
+                    {
+                        soonestTime = respawnTime;
+                        soonestIndex = index;
+                        foundSoonest = true;
+                    }
+                }
+
+                if (foundSoonest)
+                {
+                    bool indexChanged = (session.routeIndex != soonestIndex);
+                    session.routeIndex = soonestIndex;
+                    session.waitingForRespawn = true;
+                    if (indexChanged || !session.pointStartedAtMs)
+                        SetTravelTarget(botAI, session);
+                    return;
+                }
+
+                session.routeIndex = nextIndex;
+                session.waitingForRespawn = true;
             }
 
             SetTravelTarget(botAI, session);
@@ -3151,8 +3340,45 @@ namespace
             RoutePoint& point = session.route[session.routeIndex];
             if (!IsSourceSpawnActive(point.source))
             {
-                AdvanceRoute(botAI, session);
-                return std::nullopt;
+                if (session.waitingForRespawn)
+                {
+                    uint32 now = getMSTime();
+                    if (!session.lastRouteProgressAtMs || getMSTimeDiff(session.lastRouteProgressAtMs, now) >= 2000)
+                    {
+                        session.lastRouteProgressAtMs = now;
+                        for (size_t index = 0; index < session.route.size(); ++index)
+                        {
+                            if (!session.unreachableRoutePoints.contains(index) &&
+                                IsSourceSpawnActive(session.route[index].source))
+                            {
+                                session.waitingForRespawn = false;
+                                session.routeIndex = index;
+                                SetTravelTarget(botAI, session);
+                                return std::nullopt;
+                            }
+                        }
+                    }
+
+                    float distance = bot->GetExactDist(point.source.x, point.source.y, point.source.z);
+                    if (distance <= AUTOFARM_INTERACTION_DISTANCE + 5.0f)
+                    {
+                        if (bot->isMoving())
+                        {
+                            bot->GetMotionMaster()->Clear();
+                            bot->StopMoving();
+                        }
+                        return std::nullopt;
+                    }
+                }
+                else
+                {
+                    AdvanceRoute(botAI, session);
+                    return std::nullopt;
+                }
+            }
+            else
+            {
+                session.waitingForRespawn = false;
             }
 
             if (bot->GetMapId() != point.source.mapId)
@@ -3162,7 +3388,7 @@ namespace
             }
 
             uint32 now = getMSTime();
-            if (session.pointStartedAtMs &&
+            if (!session.waitingForRespawn && session.pointStartedAtMs &&
                 getMSTimeDiff(session.pointStartedAtMs, now) > _config.routePointTimeoutMs)
             {
                 if (_config.debug)
@@ -3238,6 +3464,16 @@ namespace
                 return;
             }
 
+            if (bot->IsMounted())
+                bot->Dismount();
+
+            if (bot->GetShapeshiftForm() != FORM_NONE)
+            {
+                if (GameObjectTemplate const* goTemplate = sObjectMgr->GetGameObjectTemplate(point.source.entry))
+                    if (GetGameObjectGatheringSkill(goTemplate) == SKILL_MINING)
+                        bot->RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);
+            }
+
             LootObject loot(bot, gameObject->GetGUID());
             if (loot.IsEmpty() || !loot.IsLootPossible(bot))
             {
@@ -3251,13 +3487,14 @@ namespace
             session.sourceUnavailableStartedAtMs = 0;
 
             uint32 now = getMSTime();
-            if (!session.interactionStartedAtMs)
-            {
+            if (!session.interactionStartedAtMs || bot->IsNonMeleeSpellCast(false))
                 session.interactionStartedAtMs = now;
-                botAI->GetAiObjectContext()->GetValue<LootObjectStack*>("available loot")->Get()
-                    ->Add(gameObject->GetGUID());
-                botAI->GetAiObjectContext()->GetValue<LootObject>("loot target")->Set(loot);
-            }
+
+            // Opening ordinary loot removes the gameobject from playerbots' available-loot stack.
+            // Re-add and refresh the target on every stage so subsequent mining strikes continue until depleted.
+            botAI->GetAiObjectContext()->GetValue<LootObjectStack*>("available loot")->Get()
+                ->Add(gameObject->GetGUID());
+            botAI->GetAiObjectContext()->GetValue<LootObject>("loot target")->Set(loot);
 
             if (!bot->IsNonMeleeSpellCast(false))
                 botAI->DoSpecificAction("open loot", Event(), true);

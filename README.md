@@ -100,9 +100,9 @@ activities. A normally friendly target must already be attackable, such as by ma
   target routes deliberately exclude creature sources so the character gains skill from profession nodes.
 - Fishing schools and other usable outdoor gameobjects: supported when the item is in the object's loot template.
 - Incidental resources: while targeting Peacebloom or copper, any usable nearby mining/herbalism node such as Silverleaf
-  or tin is still gathered. Herbalism routes also fill unused route slots with other usable herb nodes in the selected
-  zone, prioritizing those closest to target-item nodes. The selected material controls the zone and quantity goal,
-  not whether another farmable nearby node is gathered.
+  or tin is still gathered. Herbalism and Mining routes also fill unused route slots with other usable nodes for that
+  profession in the selected zone, prioritizing those closest to target-item nodes. The selected material controls the
+  zone and quantity goal, not whether another farmable nearby node is gathered.
 - Mining and herbalism node routes temporarily make the bot and its active pet immune to NPC and player-controlled
   combat. The character remains visible to players and can continue interacting with nodes.
 - Creature corpses are fully looted and skinned when the character has the required profession.
